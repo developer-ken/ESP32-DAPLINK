@@ -1,0 +1,435 @@
+#include "dap.h"
+#include "swd_jtag.h"
+#include "dap_config.h"
+#include "driver/gpio.h"
+#include "esp_rom_sys.h"
+#include <string.h>
+
+// ---------------- CMSIS-DAP 命令编号 ----------------
+#define ID_DAP_INFO                 0x00
+#define ID_DAP_HOST_STATUS          0x01
+#define ID_DAP_CONNECT               0x02
+#define ID_DAP_DISCONNECT            0x03
+#define ID_DAP_TRANSFER_CONFIGURE    0x04
+#define ID_DAP_TRANSFER              0x05
+#define ID_DAP_TRANSFER_BLOCK        0x06
+#define ID_DAP_TRANSFER_ABORT        0x07
+#define ID_DAP_WRITE_ABORT           0x08
+#define ID_DAP_DELAY                 0x09
+#define ID_DAP_RESET_TARGET          0x0A
+#define ID_DAP_SWJ_PINS              0x10
+#define ID_DAP_SWJ_CLOCK             0x11
+#define ID_DAP_SWJ_SEQUENCE          0x12
+#define ID_DAP_SWD_CONFIGURE         0x13
+#define ID_DAP_JTAG_SEQUENCE         0x14
+#define ID_DAP_JTAG_CONFIGURE        0x15
+#define ID_DAP_JTAG_IDCODE           0x16
+
+#define DAP_OK                       0x00
+#define DAP_ERROR                    0xFF
+
+#define DAP_TRANSFER_OK              0x01
+#define DAP_TRANSFER_WAIT            0x02
+#define DAP_TRANSFER_FAULT           0x04
+#define DAP_TRANSFER_ERROR           0x08
+#define DAP_TRANSFER_MISMATCH        0x10
+
+// SWD request bit fields (host -> target 8bit packet, 不含 start/park/parity 已由 build_swd_request 处理)
+#define SWD_REQ_APnDP  (1u << 0)
+#define SWD_REQ_RnW    (1u << 1)
+#define SWD_REQ_A2     (1u << 2)
+#define SWD_REQ_A3     (1u << 3)
+
+// JTAG-DP IR 指令
+#define JTAG_IR_DPACC  0xA
+#define JTAG_IR_APACC  0xB
+
+#define MAX_JTAG_DEVICES 4
+
+static uint8_t s_port = DAP_PORT_DISABLED;
+static uint8_t s_transfer_idle_cycles = 0;
+static uint16_t s_transfer_wait_retry = 100;
+static uint16_t s_transfer_match_retry = 0;
+
+static uint8_t s_jtag_count = 0;
+static uint8_t s_jtag_ir_len[MAX_JTAG_DEVICES] = {4, 4, 4, 4};
+static uint8_t s_jtag_index = 0;
+
+void dap_init(void)
+{
+    dap_io_init();
+    s_port = DAP_PORT_DISABLED;
+}
+
+// ================= SWD 传输 =================
+
+static uint8_t swd_parity32(uint32_t v)
+{
+    v ^= v >> 16; v ^= v >> 8; v ^= v >> 4; v ^= v >> 2; v ^= v >> 1;
+    return v & 1;
+}
+
+// 执行一次 SWD 传输，request 为 APnDP/RnW/A2/A3 组合，*data 用于读/写数据
+// 返回 3bit ACK（DAP_TRANSFER_OK/WAIT/FAULT）
+static uint8_t swd_transfer(uint8_t request, uint32_t *data)
+{
+    uint8_t parity = ((request & SWD_REQ_APnDP) != 0) + ((request & SWD_REQ_RnW) != 0) +
+                     ((request & SWD_REQ_A2) != 0) + ((request & SWD_REQ_A3) != 0);
+    parity &= 1;
+
+    uint8_t packet = 0x81; // start=1(bit0), park=1(bit7)
+    packet |= (request & 0x0F) << 1;
+    packet |= parity << 5;
+    packet |= 0 << 6; // stop = 0
+
+    dap_io_swd_dio_to_output();
+    dap_io_swd_write_bits(packet, 8);
+
+    dap_io_swd_dio_to_input();
+    dap_io_swd_turnaround();
+
+    uint32_t ack = dap_io_swd_read_bits(3);
+
+    if (ack == DAP_TRANSFER_OK) {
+        if (request & SWD_REQ_RnW) {
+            uint32_t value = dap_io_swd_read_bits(32);
+            uint32_t par = dap_io_swd_read_bits(1);
+            dap_io_swd_turnaround();
+            dap_io_swd_dio_to_output();
+            if (data) {
+                *data = value;
+            }
+            if (swd_parity32(value) != (par & 1)) {
+                return DAP_TRANSFER_ERROR;
+            }
+        } else {
+            dap_io_swd_turnaround();
+            dap_io_swd_dio_to_output();
+            uint32_t value = data ? *data : 0;
+            dap_io_swd_write_bits(value, 32);
+            dap_io_swd_write_bits(swd_parity32(value), 1);
+        }
+    } else {
+        // WAIT/FAULT：仍需完成转向，若是写操作还需释放数据阶段（无数据相位则直接切回输出）
+        if ((request & SWD_REQ_RnW) == 0) {
+            dap_io_swd_turnaround();
+        }
+        dap_io_swd_dio_to_output();
+    }
+    // 传输间隙至少留 8 个空闲 SWCLK 周期，帮助部分目标完成内部状态切换
+    dap_io_swd_write_bits(0, 8);
+    return (uint8_t)ack;
+}
+
+// ================= JTAG 传输 =================
+
+static void jtag_move(uint8_t tms_bits, uint8_t count)
+{
+    for (uint8_t i = 0; i < count; i++) {
+        dap_io_jtag_clock((tms_bits >> i) & 1, 0);
+    }
+}
+
+// 复位 TAP 到 Run-Test/Idle
+static void jtag_reset_to_idle(void)
+{
+    jtag_move(0x1F, 5); // 5 个 TMS=1 -> Test-Logic-Reset
+    jtag_move(0x00, 1); // TMS=0 -> Run-Test/Idle
+}
+
+static void jtag_shift_ir(uint8_t device_index, uint8_t ir_value)
+{
+    uint32_t before = 0, after = 0;
+    for (uint8_t i = 0; i < device_index; i++) before += s_jtag_ir_len[i];
+    for (uint8_t i = device_index + 1; i < s_jtag_count; i++) after += s_jtag_ir_len[i];
+    uint8_t len = s_jtag_ir_len[device_index];
+
+    dap_io_jtag_clock(1, 0); // idle -> select-dr
+    dap_io_jtag_clock(1, 0); // select-dr -> select-ir
+    dap_io_jtag_clock(0, 0); // select-ir -> capture-ir
+    dap_io_jtag_clock(0, 0); // capture-ir -> shift-ir
+
+    for (uint32_t i = 0; i < before; i++) dap_io_jtag_clock(0, 1);
+    for (uint8_t i = 0; i < len; i++) {
+        bool last_bit = (i == (uint8_t)(len - 1)) && (after == 0);
+        dap_io_jtag_clock(last_bit ? 1 : 0, (ir_value >> i) & 1);
+    }
+    for (uint32_t i = 0; i < after; i++) {
+        dap_io_jtag_clock((i == after - 1) ? 1 : 0, 1);
+    }
+
+    dap_io_jtag_clock(1, 0); // exit1-ir -> update-ir
+    dap_io_jtag_clock(0, 0); // update-ir -> idle
+}
+
+// 移入 bit_count 位（LSB 优先，最多 64 位）到 DR，同时捕获输出到 out（可为 NULL）
+static void jtag_shift_dr(uint8_t device_index, uint64_t value, uint8_t bit_count, uint64_t *out)
+{
+    uint32_t before = device_index;                                    // 每个前置器件 bypass 寄存器为 1 位
+    uint32_t after = s_jtag_count ? (s_jtag_count - device_index - 1) : 0;
+    uint64_t captured = 0;
+
+    dap_io_jtag_clock(1, 0); // idle -> select-dr
+    dap_io_jtag_clock(0, 0); // select-dr -> capture-dr
+    dap_io_jtag_clock(0, 0); // capture-dr -> shift-dr
+
+    for (uint32_t i = 0; i < before; i++) dap_io_jtag_clock(0, 0);
+
+    for (uint8_t i = 0; i < bit_count; i++) {
+        bool last_bit = (i == (uint8_t)(bit_count - 1)) && (after == 0);
+        uint8_t tdo = dap_io_jtag_clock(last_bit ? 1 : 0, (value >> i) & 1);
+        if (tdo) captured |= ((uint64_t)1 << i);
+    }
+    for (uint32_t i = 0; i < after; i++) {
+        dap_io_jtag_clock((i == after - 1) ? 1 : 0, 0);
+    }
+
+    dap_io_jtag_clock(1, 0); // exit1-dr -> update-dr
+    dap_io_jtag_clock(0, 0); // update-dr -> idle
+
+    if (out) *out = captured;
+}
+
+// JTAG-DP 寄存器访问：注意由于 JTAG-DP 是流水线结构，写操作返回的 ACK 对应“上一次”访问，
+// 读操作通过额外一次 RDBUFF 访问把结果“冲刷”出来，因此读操作 ACK/数据是准确的，
+// 写操作的即时 ACK 仅为近似值（与多数轻量级 CMSIS-DAP 实现一致的已知折衷）。
+static uint8_t jtag_transfer(uint8_t request, uint32_t *data)
+{
+    uint8_t ir = (request & SWD_REQ_APnDP) ? JTAG_IR_APACC : JTAG_IR_DPACC;
+    jtag_shift_ir(s_jtag_index, ir);
+
+    uint64_t addr_rnw = ((request & SWD_REQ_A2) ? 0x2 : 0) | ((request & SWD_REQ_A3) ? 0x4 : 0) |
+                        ((request & SWD_REQ_RnW) ? 0x1 : 0);
+    uint64_t dr_in = addr_rnw | ((uint64_t)(data ? *data : 0) << 3);
+    uint64_t dr_out = 0;
+    jtag_shift_dr(s_jtag_index, dr_in, 35, &dr_out);
+    uint8_t ack = dr_out & 0x7;
+
+    if (request & SWD_REQ_RnW) {
+        // 追加一次 RDBUFF 读，冲刷出真正的读结果
+        uint64_t rdbuff_req = 0x4 | 0x1; // A[3:2]=11(RDBUFF), RnW=1
+        jtag_shift_dr(s_jtag_index, rdbuff_req, 35, &dr_out);
+        ack = dr_out & 0x7;
+        if (data) *data = (uint32_t)(dr_out >> 3);
+    }
+    return ack;
+}
+
+static uint8_t do_transfer(uint8_t request, uint32_t *data)
+{
+    uint8_t ack;
+    uint16_t retry = s_transfer_wait_retry ? s_transfer_wait_retry : 1;
+    do {
+        ack = (s_port == DAP_PORT_JTAG) ? jtag_transfer(request, data) : swd_transfer(request, data);
+    } while (ack == DAP_TRANSFER_WAIT && --retry);
+    return ack;
+}
+
+// ================= DAP_Info =================
+static uint16_t dap_info(uint8_t id, uint8_t *resp)
+{
+    switch (id) {
+    case 0x01: { const char *s = DAP_USB_MANUFACTURER; uint8_t n = strlen(s) + 1; resp[0] = n; memcpy(&resp[1], s, n); return n + 1; }
+    case 0x02: { const char *s = DAP_USB_PRODUCT; uint8_t n = strlen(s) + 1; resp[0] = n; memcpy(&resp[1], s, n); return n + 1; }
+    case 0x03: { const char *s = "EGGY0001"; uint8_t n = strlen(s) + 1; resp[0] = n; memcpy(&resp[1], s, n); return n + 1; }
+    case 0x04: { const char *s = DAP_FW_VERSION; uint8_t n = strlen(s) + 1; resp[0] = n; memcpy(&resp[1], s, n); return n + 1; }
+    case 0xF0: resp[0] = 1; resp[1] = 0x03; return 2; // SWD + JTAG 均支持
+    case 0xFE: resp[0] = 1; resp[1] = DAP_PACKET_COUNT; return 2;
+    case 0xFF: resp[0] = 2; resp[1] = DAP_PACKET_SIZE & 0xFF; resp[2] = (DAP_PACKET_SIZE >> 8) & 0xFF; return 3;
+    default: resp[0] = 0; return 1;
+    }
+}
+
+uint16_t dap_process_command(const uint8_t *req, uint16_t req_len, uint8_t *resp)
+{
+    if (req_len == 0) { resp[0] = ID_DAP_INFO; resp[1] = 0; return 2; }
+    uint8_t cmd = req[0];
+    uint16_t ri = 1, wi = 0;
+    resp[wi++] = cmd;
+
+    switch (cmd) {
+    case ID_DAP_INFO: {
+        uint8_t id = req[ri++];
+        wi += dap_info(id, &resp[wi]);
+        break;
+    }
+    case ID_DAP_HOST_STATUS: {
+        uint8_t type = req[ri++];
+        uint8_t status = req[ri++];
+        gpio_set_level(type == 0 ? DAP_LED_CONNECT_PIN : DAP_LED_RUNNING_PIN, status);
+        resp[wi++] = DAP_OK;
+        break;
+    }
+    case ID_DAP_CONNECT: {
+        uint8_t port = req[ri++];
+        if (port == 0) port = DAP_PORT_SWD; // Default -> 优先 SWD
+        dap_io_connect(port);
+        s_port = port;
+        resp[wi++] = port;
+        break;
+    }
+    case ID_DAP_DISCONNECT: {
+        dap_io_disconnect();
+        s_port = DAP_PORT_DISABLED;
+        resp[wi++] = DAP_OK;
+        break;
+    }
+    case ID_DAP_TRANSFER_CONFIGURE: {
+        s_transfer_idle_cycles = req[ri++];
+        s_transfer_wait_retry = req[ri] | (req[ri + 1] << 8); ri += 2;
+        s_transfer_match_retry = req[ri] | (req[ri + 1] << 8); ri += 2;
+        resp[wi++] = DAP_OK;
+        break;
+    }
+    case ID_DAP_TRANSFER: {
+        uint8_t dap_index = req[ri++];
+        if (s_port == DAP_PORT_JTAG) s_jtag_index = dap_index;
+        uint8_t count = req[ri++];
+        uint8_t done = 0;
+        uint8_t last_ack = DAP_TRANSFER_OK;
+        uint16_t wi_count_pos = wi++;
+        for (; done < count; done++) {
+            uint8_t xreq = req[ri++];
+            uint32_t data = 0;
+            bool is_read = xreq & SWD_REQ_RnW;
+            if (!is_read) {
+                memcpy(&data, &req[ri], 4);
+                ri += 4;
+            }
+            last_ack = do_transfer(xreq & 0x0F, &data);
+            if (last_ack == DAP_TRANSFER_OK && is_read) {
+                memcpy(&resp[wi], &data, 4);
+                wi += 4;
+            }
+            if (last_ack != DAP_TRANSFER_OK) { done++; break; }
+            for (uint8_t k = 0; k < s_transfer_idle_cycles; k++) {
+                if (s_port == DAP_PORT_JTAG) dap_io_jtag_clock(0, 0);
+            }
+        }
+        resp[wi_count_pos] = done;
+        resp[wi++] = last_ack;
+        break;
+    }
+    case ID_DAP_TRANSFER_BLOCK: {
+        uint8_t dap_index = req[ri++];
+        if (s_port == DAP_PORT_JTAG) s_jtag_index = dap_index;
+        uint16_t count = req[ri] | (req[ri + 1] << 8); ri += 2;
+        uint8_t xreq = req[ri++];
+        bool is_read = xreq & SWD_REQ_RnW;
+        uint8_t ack = DAP_TRANSFER_OK;
+        uint16_t done = 0;
+        uint16_t wi_count_pos = wi; wi += 2;
+        for (; done < count; done++) {
+            uint32_t data = 0;
+            if (!is_read) { memcpy(&data, &req[ri], 4); ri += 4; }
+            ack = do_transfer(xreq & 0x0F, &data);
+            if (ack != DAP_TRANSFER_OK) { done++; break; }
+            if (is_read) { memcpy(&resp[wi], &data, 4); wi += 4; }
+        }
+        resp[wi_count_pos] = done & 0xFF;
+        resp[wi_count_pos + 1] = (done >> 8) & 0xFF;
+        resp[wi++] = ack;
+        break;
+    }
+    case ID_DAP_TRANSFER_ABORT:
+        // 位带实现下传输是同步阻塞完成的，无排队命令可中止
+        resp[wi++] = DAP_OK;
+        break;
+    case ID_DAP_WRITE_ABORT: {
+        ri++; // DAP Index，忽略
+        uint32_t value;
+        memcpy(&value, &req[ri], 4); ri += 4;
+        do_transfer(0, &value); // 写 DP ABORT 寄存器 (APnDP=0,RnW=0,A=0x0)
+        resp[wi++] = DAP_OK;
+        break;
+    }
+    case ID_DAP_DELAY: {
+        uint16_t us = req[ri] | (req[ri + 1] << 8); ri += 2;
+        esp_rom_delay_us(us);
+        resp[wi++] = DAP_OK;
+        break;
+    }
+    case ID_DAP_RESET_TARGET: {
+        dap_io_set_nreset(true);
+        esp_rom_delay_us(10000);
+        dap_io_set_nreset(false);
+        resp[wi++] = DAP_OK;
+        resp[wi++] = 0; // 未执行设备专属复位序列
+        break;
+    }
+    case ID_DAP_SWJ_PINS: {
+        uint8_t value = req[ri++];
+        uint8_t select = req[ri++];
+        uint32_t wait_us;
+        memcpy(&wait_us, &req[ri], 4); ri += 4;
+        dap_io_set_swj_pins(value, select);
+        if (wait_us) esp_rom_delay_us(wait_us > 100000 ? 100000 : wait_us);
+        resp[wi++] = dap_io_get_swj_pins();
+        break;
+    }
+    case ID_DAP_SWJ_CLOCK: {
+        uint32_t clk;
+        memcpy(&clk, &req[ri], 4); ri += 4;
+        dap_io_set_clock(clk);
+        resp[wi++] = DAP_OK;
+        break;
+    }
+    case ID_DAP_SWJ_SEQUENCE: {
+        uint8_t count = req[ri++];
+        uint32_t bits = count == 0 ? 256 : count;
+        dap_io_swj_sequence(bits, &req[ri]);
+        resp[wi++] = DAP_OK;
+        break;
+    }
+    case ID_DAP_SWD_CONFIGURE: {
+        uint8_t cfg = req[ri++];
+        dap_io_swd_configure((cfg & 0x03) + 1);
+        resp[wi++] = DAP_OK;
+        break;
+    }
+    case ID_DAP_JTAG_SEQUENCE: {
+        uint8_t seq_count = req[ri++];
+        for (uint8_t s = 0; s < seq_count; s++) {
+            uint8_t info = req[ri++];
+            uint8_t tck_count = info & 0x3F; if (tck_count == 0) tck_count = 64;
+            uint8_t tms = (info >> 6) & 1;
+            bool capture = (info >> 7) & 1;
+            uint8_t nbytes = (tck_count + 7) / 8;
+            uint8_t tdo_bytes[8] = {0};
+            for (uint8_t i = 0; i < tck_count; i++) {
+                uint8_t tdi = (req[ri + (i >> 3)] >> (i & 7)) & 1;
+                uint8_t tdo = dap_io_jtag_clock(tms, tdi);
+                if (tdo) tdo_bytes[i >> 3] |= (1u << (i & 7));
+            }
+            ri += nbytes;
+            if (capture) { memcpy(&resp[wi], tdo_bytes, nbytes); wi += nbytes; }
+        }
+        resp[wi++] = DAP_OK;
+        break;
+    }
+    case ID_DAP_JTAG_CONFIGURE: {
+        uint8_t count = req[ri++];
+        if (count > MAX_JTAG_DEVICES) count = MAX_JTAG_DEVICES;
+        s_jtag_count = count;
+        for (uint8_t i = 0; i < count; i++) s_jtag_ir_len[i] = req[ri++];
+        resp[wi++] = DAP_OK;
+        break;
+    }
+    case ID_DAP_JTAG_IDCODE: {
+        uint8_t index = req[ri++];
+        // JTAG 复位后每个器件默认选中 IDCODE 指令，无需显式写 IR
+        jtag_reset_to_idle();
+        uint64_t idcode64 = 0;
+        jtag_shift_dr(index, 0, 32, &idcode64);
+        uint32_t idcode = (uint32_t)idcode64;
+        resp[wi++] = DAP_OK;
+        memcpy(&resp[wi], &idcode, 4); wi += 4;
+        break;
+    }
+    default:
+        // 未知命令：按 CMSIS-DAP 规范返回 0xFF
+        resp[0] = 0xFF;
+        return 1;
+    }
+    return wi;
+}

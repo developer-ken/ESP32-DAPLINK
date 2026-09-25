@@ -1,0 +1,21 @@
+# USB (native USB-OTG on ESP32-S3) as CMSIS-DAP composite device
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_USB_OTG_SUPPORTED=y
+CONFIG_TINYUSB_HID_COUNT=1
+CONFIG_TINYUSB_MSC_ENABLED=y
+CONFIG_TINYUSB_MSC_BUFSIZE=4096
+
+# Custom partition table with 1MB read-only "storage" data partition
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# Wi-Fi + mDNS fallback bridge
+CONFIG_ESP_WIFI_ENABLED=y
+CONFIG_LWIP_LOCAL_HOSTNAME="eggydebugger"
+
+# Larger main task stack: CMSIS-DAP + Wi-Fi + mDNS all run from app_main helpers
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# FreeRTOS timer / misc tuning for many small tasks (USB, TCP server, mdns)
+CONFIG_FREERTOS_HZ=1000
