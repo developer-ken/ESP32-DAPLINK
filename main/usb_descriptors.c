@@ -1,4 +1,4 @@
-// USB 设备/配置/HID 描述符 + HID 类回调（CMSIS-DAP 走 HID Vendor collection，64 字节 IN/OUT）
+// USB 设备描述符与 CMSIS-DAP vendor bulk 收发回调
 #include "usb_descriptors.h"
 #include "dap_config.h"
 #include "dap.h"
@@ -36,36 +36,47 @@ tusb_desc_device_t const g_usb_device_descriptor = {
     .bNumConfigurations = 0x01
 };
 
-// ---------------- HID 报告描述符（CMSIS-DAP 厂商自定义） ----------------
+// ---------------- HID Report Descriptor ----------------
 static uint8_t const s_hid_report_descriptor[] = {
-    0x06, 0x00, 0xFF,       // Usage Page (Vendor Defined 0xFF00)
-    0x09, 0x01,             // Usage (0x01)
-    0xA1, 0x01,             // Collection (Application)
-    0x15, 0x00,             //   Logical Minimum (0)
-    0x26, 0xFF, 0x00,       //   Logical Maximum (255)
-    0x75, 0x08,             //   Report Size (8)
-    0x95, HID_EP_SIZE,      //   Report Count
-    0x09, 0x01,             //   Usage (0x01)
-    0x81, 0x02,             //   Input (Data,Var,Abs)
-    0x95, HID_EP_SIZE,      //   Report Count
-    0x09, 0x01,             //   Usage (0x01)
-    0x91, 0x02,             //   Output (Data,Var,Abs)
-    0xC0                    // End Collection
+    0x06, 0x00, 0xFF,
+    0x09, 0x01,
+    0xA1, 0x01,
+    0x15, 0x00,
+    0x26, 0xFF, 0x00,
+    0x75, 0x08,
+    0x95, HID_EP_SIZE,
+    0x09, 0x01,
+    0x81, 0x02,
+    0x95, HID_EP_SIZE,
+    0x09, 0x01,
+    0x91, 0x02,
+    0xC0
 };
 
-uint8_t const *tud_hid_descriptor_report_cb(uint8_t itf)
+uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 {
-    (void)itf;
+    (void)instance;
     return s_hid_report_descriptor;
 }
 
-// ---------------- 配置描述符（HID + MSC 复合设备） ----------------
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type,
+                               uint8_t *buffer, uint16_t reqlen)
+{
+    (void)instance;
+    (void)report_id;
+    (void)report_type;
+    (void)buffer;
+    (void)reqlen;
+    return 0;
+}
+
+// ---------------- 配置描述符（CMSIS-DAP HID + MSC） ----------------
 #define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_INOUT_DESC_LEN + TUD_MSC_DESC_LEN)
 
 uint8_t const g_usb_fs_config_descriptor[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
 
-    TUD_HID_INOUT_DESCRIPTOR(ITF_NUM_HID, 0, HID_ITF_PROTOCOL_NONE,
+    TUD_HID_INOUT_DESCRIPTOR(ITF_NUM_HID, 4, HID_ITF_PROTOCOL_NONE,
                               sizeof(s_hid_report_descriptor),
                               EPNUM_HID_OUT, EPNUM_HID_IN, HID_EP_SIZE, 1),
 
@@ -84,19 +95,17 @@ char const *g_usb_string_descriptor[] = {
 const size_t g_usb_string_descriptor_count =
     sizeof(g_usb_string_descriptor) / sizeof(g_usb_string_descriptor[0]);
 
-// ---------------- HID 类回调：所有 CMSIS-DAP 命令通过 OUT 报告进入，处理后经 IN 报告返回 ----------------
-void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type,
-                            uint8_t const *buffer, uint16_t bufsize)
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type,
+                           uint8_t const *buffer, uint16_t bufsize)
 {
-    (void)itf; (void)report_id; (void)report_type;
-    uint8_t resp[DAP_PACKET_SIZE];
-    uint16_t len = dap_process_command(buffer, bufsize, resp);
-    tud_hid_report(0, resp, len);
+    (void)report_id;
+    (void)report_type;
+    if (instance != 0 || bufsize == 0 || bufsize > DAP_PACKET_SIZE) {
+        return;
+    }
+
+    uint8_t response[DAP_PACKET_SIZE] = {0};
+    dap_process_command(buffer, bufsize, response);
+    tud_hid_report(0, response, sizeof(response));
 }
 
-uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type,
-                               uint8_t *buffer, uint16_t reqlen)
-{
-    (void)itf; (void)report_id; (void)report_type; (void)buffer; (void)reqlen;
-    return 0;
-}

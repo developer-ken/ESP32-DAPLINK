@@ -2,6 +2,7 @@
 CONFIG_IDF_TARGET="esp32s3"
 CONFIG_USB_OTG_SUPPORTED=y
 CONFIG_TINYUSB_HID_COUNT=1
+CONFIG_TINYUSB_VENDOR_COUNT=0
 CONFIG_TINYUSB_MSC_ENABLED=y
 CONFIG_TINYUSB_MSC_BUFSIZE=4096
 
@@ -16,6 +17,11 @@ CONFIG_LWIP_LOCAL_HOSTNAME="eggydebugger"
 
 # Larger main task stack: CMSIS-DAP + Wi-Fi + mDNS all run from app_main helpers
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# 禁用 USB-Serial-JTAG 副控制台：否则它会在启动早期占用内部 USB PHY，
+# 导致自定义 TinyUSB CMSIS-DAP 复合设备无法枚举（表现为电脑仍识别到自带的
+# "USB JTAG/serial debug unit"）
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
 # FreeRTOS timer / misc tuning for many small tasks (USB, TCP server, mdns)
 CONFIG_FREERTOS_HZ=1000

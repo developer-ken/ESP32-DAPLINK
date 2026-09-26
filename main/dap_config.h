@@ -4,28 +4,33 @@
 #include "driver/gpio.h"
 
 // ---------------- SWD 引脚定义 ----------------
-#define DAP_SWD_CLK_PIN        GPIO_NUM_4   // SWCLK
-#define DAP_SWD_DIO_PIN        GPIO_NUM_5   // SWDIO (双向)
+#define DAP_SWD_CLK_PIN        GPIO_NUM_36   // SWCLK
+#define DAP_SWD_DIO_PIN        GPIO_NUM_38   // SWDIO (双向)
 
 // ---------------- JTAG 引脚定义 ----------------
-#define DAP_JTAG_TCK_PIN       GPIO_NUM_4   // 与 SWCLK 共用
-#define DAP_JTAG_TMS_PIN       GPIO_NUM_5   // 与 SWDIO 共用
-#define DAP_JTAG_TDI_PIN       GPIO_NUM_6
-#define DAP_JTAG_TDO_PIN       GPIO_NUM_7
+#define DAP_JTAG_TCK_PIN       DAP_SWD_CLK_PIN   // 与 SWCLK 共用
+#define DAP_JTAG_TMS_PIN       DAP_SWD_DIO_PIN   // 与 SWDIO 共用
+#define DAP_JTAG_TDI_PIN       GPIO_NUM_34
+#define DAP_JTAG_TDO_PIN       GPIO_NUM_29
 
 // ---------------- 公共控制引脚 ----------------
-#define DAP_NRESET_PIN         GPIO_NUM_15  // 目标复位 (开漏, 低有效)
-#define DAP_LED_CONNECT_PIN    GPIO_NUM_2   // 连接状态指示灯
-#define DAP_LED_RUNNING_PIN    GPIO_NUM_1   // 运行状态指示灯
+#define DAP_NRESET_PIN         GPIO_NUM_35  // 目标复位 (开漏, 低有效)
+#define DAP_LED_CONNECT_PIN    GPIO_NUM_8   // 连接状态指示灯
+#define DAP_LED_RUNNING_PIN    GPIO_NUM_6   // 运行状态指示灯
 
 // 是否使用 nTRST（多数 Cortex-M 目标不需要）
-#define DAP_JTAG_HAS_TRST      0
-#define DAP_JTAG_TRST_PIN      GPIO_NUM_16
+#define DAP_JTAG_HAS_TRST      1
+#define DAP_JTAG_TRST_PIN      GPIO_NUM_33
+
+// ---------------- 板载状态灯（低电平点亮）----------------
+// 映射到未使用引脚
+#define BOARD_LED_PWR_PIN      GPIO_NUM_42   // 上电常亮，表示程序已开始运行
+#define BOARD_LED_ACT_PIN      GPIO_NUM_41   // 运行时 0.5s 间隔闪烁，表示主循环存活
 
 // ---------------- USB 设备信息 ----------------
 #define DAP_USB_VID            0x303A       // Espressif VID
 #define DAP_USB_PID            0x8001
-#define DAP_USB_MANUFACTURER   "Eggy"
+#define DAP_USB_MANUFACTURER   "AnEgg"
 #define DAP_USB_PRODUCT        "Eggy CMSIS-DAP"
 #define DAP_FW_VERSION         "v1.0.0"
 

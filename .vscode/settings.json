@@ -12,5 +12,6 @@
       "--background-index",
       "--query-driver=**",
       "--compile-commands-dir=c:\\Users\\dengb\\Documents\\Development\\ESP32-DAPLINK\\build"
-    ]
+    ],
+    "idf.flashType": "UART"
 }

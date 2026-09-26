@@ -9,13 +9,28 @@
 #include "nvs_flash.h"
 #include "tinyusb_default_config.h"
 #include "esp_log.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const char *TAG = "main";
 
+// LED_PWR/LED_ACT 均为低电平点亮
+static void board_leds_init(void)
+{
+    gpio_config_t io_conf = {};
+    io_conf.pin_bit_mask = (1ULL << BOARD_LED_PWR_PIN) | (1ULL << BOARD_LED_ACT_PIN);
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    gpio_config(&io_conf);
+    gpio_set_level(BOARD_LED_PWR_PIN, 1); // 先熄灭，初始化完成后再点亮
+    gpio_set_level(BOARD_LED_ACT_PIN, 1);
+}
+
 extern "C" void app_main(void)
 {
+    board_leds_init();
+    gpio_set_level(BOARD_LED_PWR_PIN, 0); // 程序已开始运行：常亮
+
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -57,6 +72,9 @@ extern "C" void app_main(void)
     }
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        gpio_set_level(BOARD_LED_ACT_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        gpio_set_level(BOARD_LED_ACT_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
