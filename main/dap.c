@@ -389,6 +389,7 @@ uint16_t dap_process_command(const uint8_t *req, uint16_t req_len, uint8_t *resp
     }
     case ID_DAP_JTAG_SEQUENCE: {
         uint8_t seq_count = req[ri++];
+        resp[wi++] = DAP_OK;
         for (uint8_t s = 0; s < seq_count; s++) {
             uint8_t info = req[ri++];
             uint8_t tck_count = info & 0x3F; if (tck_count == 0) tck_count = 64;
@@ -404,7 +405,6 @@ uint16_t dap_process_command(const uint8_t *req, uint16_t req_len, uint8_t *resp
             ri += nbytes;
             if (capture) { memcpy(&resp[wi], tdo_bytes, nbytes); wi += nbytes; }
         }
-        resp[wi++] = DAP_OK;
         break;
     }
     case ID_DAP_JTAG_CONFIGURE: {
