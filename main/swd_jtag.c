@@ -40,8 +40,8 @@ void dap_io_init(void)
     io_conf.pin_bit_mask = (1ULL << DAP_LED_CONNECT_PIN) | (1ULL << DAP_LED_RUNNING_PIN);
     io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
     gpio_config(&io_conf);
-    gpio_set_level(DAP_LED_CONNECT_PIN, 0);
-    gpio_set_level(DAP_LED_RUNNING_PIN, 0);
+    gpio_set_level(DAP_LED_CONNECT_PIN, 1);
+    gpio_set_level(DAP_LED_RUNNING_PIN, 1);
 }
 
 void dap_io_deinit(void)
@@ -80,7 +80,7 @@ void dap_io_connect(uint8_t port)
         gpio_config(&io_conf);
     }
 
-    gpio_set_level(DAP_LED_CONNECT_PIN, port != DAP_PORT_DISABLED);
+    gpio_set_level(DAP_LED_CONNECT_PIN, port == DAP_PORT_DISABLED);
 }
 
 void dap_io_disconnect(void)
@@ -94,7 +94,7 @@ void dap_io_disconnect(void)
         gpio_set_direction(DAP_JTAG_TDI_PIN, GPIO_MODE_INPUT);
     }
     s_port = DAP_PORT_DISABLED;
-    gpio_set_level(DAP_LED_CONNECT_PIN, 0);
+    gpio_set_level(DAP_LED_CONNECT_PIN, 1);
 }
 
 void dap_io_set_clock(uint32_t clock_hz)

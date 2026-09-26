@@ -256,7 +256,7 @@ uint16_t dap_process_command(const uint8_t *req, uint16_t req_len, uint8_t *resp
     case ID_DAP_HOST_STATUS: {
         uint8_t type = req[ri++];
         uint8_t status = req[ri++];
-        gpio_set_level(type == 0 ? DAP_LED_CONNECT_PIN : DAP_LED_RUNNING_PIN, status);
+        gpio_set_level(type == 0 ? DAP_LED_CONNECT_PIN : DAP_LED_RUNNING_PIN, !status);
         resp[wi++] = DAP_OK;
         break;
     }
