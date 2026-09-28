@@ -13,26 +13,26 @@
 
 static uint8_t s_port = DAP_PORT_DISABLED;
 static uint32_t s_half_period_ns = 1000; // 默认 ~500kHz
+static uint32_t s_half_period_cycles = 0; // 与 s_half_period_ns 配套，只在 dap_io_set_clock() 里算一次
 static uint8_t s_turnaround_cycles = 1;
 
 // 忙等延时（纳秒级）。之前亚微秒档完全不限速，实际翻转速率只取决于 gpio_set_level
 // 调用本身的开销，跟主机请求的时钟频率毫无关系——杜邦线/面包板走线在这种不受控的高速
 // 翻转下容易出现建立时间不足、过冲振铃，导致目标采样到错误电平（表现为 ACK/IDR 读取失败）。
-// 改用 CPU 周期计数忙等，保证亚微秒档也能按请求频率输出。
+// 改用 CPU 周期计数忙等，保证亚微秒档也能按请求频率输出。周期数缓存在 dap_io_set_clock() 里算好，
+// 避免每个 bit 都重复调用 esp_rom_get_cpu_ticks_per_us()。
 static inline void half_period_delay(void)
 {
     if (s_half_period_ns >= 1000) {
         esp_rom_delay_us(s_half_period_ns / 1000);
         return;
     }
-    uint32_t ticks_per_us = esp_rom_get_cpu_ticks_per_us();
-    uint32_t cycles = (uint32_t)((uint64_t)s_half_period_ns * ticks_per_us / 1000);
-    if (cycles == 0) {
+    if (s_half_period_cycles == 0) {
         __asm__ __volatile__("nop; nop; nop; nop;");
         return;
     }
     uint32_t start = esp_cpu_get_cycle_count();
-    while ((esp_cpu_get_cycle_count() - start) < cycles) {
+    while ((esp_cpu_get_cycle_count() - start) < s_half_period_cycles) {
         // 忙等
     }
 }
@@ -144,6 +144,13 @@ void dap_io_set_clock(uint32_t clock_hz)
     // 半周期时间 = 1e9 / (2 * freq)，最小钳位到 0（进入高速空转档）
     uint64_t half_ns = 1000000000ULL / (2ULL * clock_hz);
     s_half_period_ns = (uint32_t)half_ns;
+    if (s_half_period_ns < 1000) {
+        // 提前算好周期数，避免热路径里每次都重新查 CPU 主频
+        uint32_t ticks_per_us = esp_rom_get_cpu_ticks_per_us();
+        s_half_period_cycles = (uint32_t)((uint64_t)s_half_period_ns * ticks_per_us / 1000);
+    } else {
+        s_half_period_cycles = 0;
+    }
 }
 
 uint8_t dap_io_get_swj_pins(void)
