@@ -38,6 +38,7 @@ void dap_io_swd_dio_to_input(void);
 void dap_io_swd_write_bits(uint32_t value, int count);   // 需先切到输出方向
 uint32_t dap_io_swd_read_bits(int count);                // 需先切到输入方向
 void dap_io_swd_turnaround(void);                        // 空转 N 个 SWCLK 周期（转向周期）
+void dap_io_swd_dio_idle_high(void);                     // 仅拉高 SWDIO 电平，不产生时钟脉冲（传输收尾用）
 
 // ---------------- JTAG ----------------
 // 单个 TCK 周期：先给出 tms/tdi，再采样 tdo，返回 tdo 电平(0/1)

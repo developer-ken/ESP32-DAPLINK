@@ -40,6 +40,9 @@
 #define SWD_REQ_A2     (1u << 2)
 #define SWD_REQ_A3     (1u << 3)
 
+// DP RDBUFF 寄存器（APnDP=0,RnW=1,A[3:2]=0b11）：用于冲刷 AP 寄存器读的流水线结果
+#define DP_RDBUFF_REQ  (SWD_REQ_A3 | SWD_REQ_A2 | SWD_REQ_RnW)
+
 // JTAG-DP IR 指令
 #define JTAG_IR_DPACC  0xA
 #define JTAG_IR_APACC  0xB
@@ -70,7 +73,7 @@ static uint8_t swd_parity32(uint32_t v)
 }
 
 // 执行一次 SWD 传输，request 为 APnDP/RnW/A2/A3 组合，*data 用于读/写数据
-// 返回 3bit ACK（DAP_TRANSFER_OK/WAIT/FAULT）
+// 返回 3bit ACK（DAP_TRANSFER_OK/WAIT/FAULT），收尾逻辑对齐 ARM 官方 SW_DP.c 参考实现
 static uint8_t swd_transfer(uint8_t request, uint32_t *data)
 {
     uint8_t parity = ((request & SWD_REQ_APnDP) != 0) + ((request & SWD_REQ_RnW) != 0) +
@@ -80,7 +83,6 @@ static uint8_t swd_transfer(uint8_t request, uint32_t *data)
     uint8_t packet = 0x81; // start=1(bit0), park=1(bit7)
     packet |= (request & 0x0F) << 1;
     packet |= parity << 5;
-    packet |= 0 << 6; // stop = 0
 
     dap_io_swd_dio_to_output();
     dap_io_swd_write_bits(packet, 8);
@@ -100,7 +102,7 @@ static uint8_t swd_transfer(uint8_t request, uint32_t *data)
                 *data = value;
             }
             if (swd_parity32(value) != (par & 1)) {
-                return DAP_TRANSFER_ERROR;
+                ack = DAP_TRANSFER_ERROR;
             }
         } else {
             dap_io_swd_turnaround();
@@ -109,15 +111,29 @@ static uint8_t swd_transfer(uint8_t request, uint32_t *data)
             dap_io_swd_write_bits(value, 32);
             dap_io_swd_write_bits(swd_parity32(value), 1);
         }
-    } else {
-        // WAIT/FAULT：仍需完成转向，若是写操作还需释放数据阶段（无数据相位则直接切回输出）
-        if ((request & SWD_REQ_RnW) == 0) {
-            dap_io_swd_turnaround();
+        // 按主机通过 DAP_TransferConfigure 配置的 idle cycles 补齐（OpenOCD 默认配置为 0）
+        if (s_transfer_idle_cycles) {
+            dap_io_swd_write_bits(0, s_transfer_idle_cycles);
         }
-        dap_io_swd_dio_to_output();
+        dap_io_swd_dio_idle_high();
+        return (uint8_t)ack;
     }
-    // 传输间隙至少留 8 个空闲 SWCLK 周期，帮助部分目标完成内部状态切换
-    dap_io_swd_write_bits(0, 8);
+
+    if (ack == DAP_TRANSFER_WAIT || ack == DAP_TRANSFER_FAULT) {
+        // WAIT/FAULT：无数据相位，但 ACK 阶段是目标在驱动总线，不管读写都必须先转向才能切回输出，
+        // 否则会在这一个 SWCLK 周期内跟目标抢总线，导致目标 SW-DP 协议错误、后续访问持续失败
+        dap_io_swd_turnaround();
+        dap_io_swd_dio_to_output();
+        dap_io_swd_dio_idle_high();
+        return (uint8_t)ack;
+    }
+
+    // 协议错误（ACK 既不是 OK/WAIT/FAULT，例如总线悬空读回的垃圾值）：目标可能仍以为自己
+    // 处在 32+1 位数据相位里，多放空这段周期再收回总线，避免只转向 1 拍就抢线
+    dap_io_swd_turnaround();
+    dap_io_swd_read_bits(33);
+    dap_io_swd_dio_to_output();
+    dap_io_swd_dio_idle_high();
     return (uint8_t)ack;
 }
 
@@ -288,26 +304,98 @@ uint16_t dap_process_command(const uint8_t *req, uint16_t req_len, uint8_t *resp
         uint8_t done = 0;
         uint8_t last_ack = DAP_TRANSFER_OK;
         uint16_t wi_count_pos = wi++;
+        uint16_t wi_ack_pos = wi++; // ack 必须紧跟在 count 后面、data 之前（CMSIS-DAP 规范）
+        // SWD 下 AP 寄存器读是流水线的：发出请求那一刻返回的数据是“上一次”访问的结果，
+        // 必须靠再访问一次（下一次 AP 读，或用 DP RDBUFF）才能把真正的值冲出来——
+        // 否则读到的永远是上一次/初始的陈旧值（表现为 CPUID 之类的寄存器读回 0）。
+        // JTAG 下 jtag_transfer() 每次内部已经自带一次 RDBUFF 冲刷，不需要这里再处理。
+        bool post_read = false;
         for (; done < count; done++) {
             uint8_t xreq = req[ri++];
             uint32_t data = 0;
             bool is_read = xreq & SWD_REQ_RnW;
-            if (!is_read) {
+
+            if (s_port != DAP_PORT_SWD) {
+                if (!is_read) {
+                    memcpy(&data, &req[ri], 4);
+                    ri += 4;
+                }
+                last_ack = do_transfer(xreq & 0x0F, &data);
+                if (last_ack == DAP_TRANSFER_OK && is_read) {
+                    memcpy(&resp[wi], &data, 4);
+                    wi += 4;
+                }
+                if (last_ack != DAP_TRANSFER_OK) { done++; break; }
+                for (uint8_t k = 0; k < s_transfer_idle_cycles; k++) {
+                    if (s_port == DAP_PORT_JTAG) dap_io_jtag_clock(0, 0);
+                }
+                continue;
+            }
+
+            if (is_read) {
+                if (post_read) {
+                    // 上一次挂起的 AP 读还没取回，这次先把它冲出来
+                    if (xreq & SWD_REQ_APnDP) {
+                        // 连续 AP 读：这次访问顺带取回上一次的数据，同时又给自己挂起新的一次
+                        last_ack = do_transfer(xreq & 0x0F, &data);
+                    } else {
+                        // 换成了 DP 读，必须单独用 RDBUFF 冲刷
+                        last_ack = do_transfer(DP_RDBUFF_REQ, &data);
+                        post_read = false;
+                    }
+                    if (last_ack != DAP_TRANSFER_OK) { done++; break; }
+                    memcpy(&resp[wi], &data, 4);
+                    wi += 4;
+                    if (xreq & SWD_REQ_APnDP) {
+                        for (uint8_t k = 0; k < s_transfer_idle_cycles; k++) {
+                            if (s_port == DAP_PORT_JTAG) dap_io_jtag_clock(0, 0);
+                        }
+                        continue; // 上面那次访问已经顺带完成了这次 AP 读的请求
+                    }
+                }
+
+                if (xreq & SWD_REQ_APnDP) {
+                    // AP 读是流水线的：立即返回的数据不可用，挂起等下一次访问再取
+                    last_ack = do_transfer(xreq & 0x0F, NULL);
+                    if (last_ack != DAP_TRANSFER_OK) { done++; break; }
+                    post_read = true;
+                } else {
+                    // DP 读没有流水线延迟，直接拿结果
+                    last_ack = do_transfer(xreq & 0x0F, &data);
+                    if (last_ack != DAP_TRANSFER_OK) { done++; break; }
+                    memcpy(&resp[wi], &data, 4);
+                    wi += 4;
+                }
+            } else {
+                if (post_read) {
+                    // 写之前先用 RDBUFF 冲掉挂起的 AP 读
+                    last_ack = do_transfer(DP_RDBUFF_REQ, &data);
+                    post_read = false;
+                    if (last_ack != DAP_TRANSFER_OK) { done++; break; }
+                    memcpy(&resp[wi], &data, 4);
+                    wi += 4;
+                }
                 memcpy(&data, &req[ri], 4);
                 ri += 4;
+                last_ack = do_transfer(xreq & 0x0F, &data);
+                if (last_ack != DAP_TRANSFER_OK) { done++; break; }
             }
-            last_ack = do_transfer(xreq & 0x0F, &data);
-            if (last_ack == DAP_TRANSFER_OK && is_read) {
-                memcpy(&resp[wi], &data, 4);
-                wi += 4;
-            }
-            if (last_ack != DAP_TRANSFER_OK) { done++; break; }
+
             for (uint8_t k = 0; k < s_transfer_idle_cycles; k++) {
                 if (s_port == DAP_PORT_JTAG) dap_io_jtag_clock(0, 0);
             }
         }
+        if (last_ack == DAP_TRANSFER_OK && post_read) {
+            // 批次结束时还有一次挂起的 AP 读，补一次 RDBUFF 冲出最终结果
+            uint32_t data = 0;
+            last_ack = do_transfer(DP_RDBUFF_REQ, &data);
+            if (last_ack == DAP_TRANSFER_OK) {
+                memcpy(&resp[wi], &data, 4);
+                wi += 4;
+            }
+        }
         resp[wi_count_pos] = done;
-        resp[wi++] = last_ack;
+        resp[wi_ack_pos] = last_ack;
         break;
     }
     case ID_DAP_TRANSFER_BLOCK: {
@@ -316,19 +404,39 @@ uint16_t dap_process_command(const uint8_t *req, uint16_t req_len, uint8_t *resp
         uint16_t count = req[ri] | (req[ri + 1] << 8); ri += 2;
         uint8_t xreq = req[ri++];
         bool is_read = xreq & SWD_REQ_RnW;
+        bool is_ap = xreq & SWD_REQ_APnDP;
         uint8_t ack = DAP_TRANSFER_OK;
         uint16_t done = 0;
         uint16_t wi_count_pos = wi; wi += 2;
-        for (; done < count; done++) {
-            uint32_t data = 0;
-            if (!is_read) { memcpy(&data, &req[ri], 4); ri += 4; }
-            ack = do_transfer(xreq & 0x0F, &data);
-            if (ack != DAP_TRANSFER_OK) { done++; break; }
-            if (is_read) { memcpy(&resp[wi], &data, 4); wi += 4; }
+        uint16_t wi_ack_pos = wi++; // ack 必须紧跟在 count 后面、data 之前
+        if (is_read && is_ap && s_port == DAP_PORT_SWD) {
+            // AP 块读同样是流水线的：先占位读一次把管线填上（结果丢弃），
+            // 最后一次改读 DP RDBUFF 把最后挂起的数据冲出来
+            ack = do_transfer(xreq & 0x0F, NULL);
+        }
+        if (ack == DAP_TRANSFER_OK) {
+            for (; done < count; done++) {
+                uint32_t data = 0;
+                if (!is_read) {
+                    memcpy(&data, &req[ri], 4);
+                    ri += 4;
+                    ack = do_transfer(xreq & 0x0F, &data);
+                    if (ack != DAP_TRANSFER_OK) { done++; break; }
+                    continue;
+                }
+                uint8_t this_req = xreq & 0x0F;
+                if (is_ap && s_port == DAP_PORT_SWD && done == (uint16_t)(count - 1)) {
+                    this_req = DP_RDBUFF_REQ;
+                }
+                ack = do_transfer(this_req, &data);
+                if (ack != DAP_TRANSFER_OK) { done++; break; }
+                memcpy(&resp[wi], &data, 4);
+                wi += 4;
+            }
         }
         resp[wi_count_pos] = done & 0xFF;
         resp[wi_count_pos + 1] = (done >> 8) & 0xFF;
-        resp[wi++] = ack;
+        resp[wi_ack_pos] = ack;
         break;
     }
     case ID_DAP_TRANSFER_ABORT:
