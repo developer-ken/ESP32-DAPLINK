@@ -7,6 +7,14 @@
 #define DAP_SWD_CLK_PIN        GPIO_NUM_36   // SWCLK
 #define DAP_SWD_DIO_PIN        GPIO_NUM_38   // SWDIO (双向)
 
+// ---------------- SWD/JTAG 位带时序校准 ----------------
+// 半个 SWCLK/TCK 周期内，除忙等延时外“固定开销”（GPIO 写 + 循环分支）消耗的 CPU 周期数。
+// 用途：1) 请求频率足够高时进入 fast 档——不再忙等，由指令开销本身决定实际速率（即 bit-bang 极限）；
+//      2) slow 档精确分频——忙等周期数 = 目标半周期 - 本开销。
+// 该值与 CPU 主频、引脚是否走 GPIO 矩阵、编译优化等级有关，请用示波器实测 SWCLK 频率微调。
+// 经验参考：ESP32-S3 @240MHz ≈ 23（cmsis_dap_tcp_esp32 实测值）。实际频率偏高时调大、偏低时调小。
+#define DAP_BIT_OVERHEAD_CYCLES   23
+
 // ---------------- JTAG 引脚定义 ----------------
 #define DAP_JTAG_TCK_PIN       GPIO_NUM_36   // 与 SWCLK 共用
 #define DAP_JTAG_TMS_PIN       GPIO_NUM_38   // 与 SWDIO 共用

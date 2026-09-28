@@ -25,3 +25,7 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
 # FreeRTOS timer / misc tuning for many small tasks (USB, TCP server, mdns)
 CONFIG_FREERTOS_HZ=1000
+
+# 240 MHz CPU：bit-bang SWD 的 fast 档可到 ~5 MHz（160 MHz 下约 3.5~4 MHz）
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
