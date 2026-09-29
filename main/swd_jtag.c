@@ -6,6 +6,7 @@
 #include "esp_attr.h"
 #include "hal/gpio_ll.h"
 #include "freertos/FreeRTOS.h"
+#include "sdkconfig.h"
 
 // gpio_set_level()/gpio_get_level() 经过驱动层的参数检查和自旋锁，单次调用开销可达数百 ns，
 // 在位带时序的热路径里会让实际翻转速率远低于请求频率（示波器实测 2MHz 请求只能跑出 ~300kHz）。
@@ -25,30 +26,24 @@ static bool s_use_critical = false; // 高频档才加临界区：低频档周�
 // 这样无关中断仍能在两段位序列之间得到服务。
 static portMUX_TYPE s_io_mux = portMUX_INITIALIZER_UNLOCKED;
 
-// 忙等延时（纳秒级）。之前亚微秒档完全不限速，实际翻转速率只取决于 gpio_set_level
-// 调用本身的开销，跟主机请求的时钟频率毫无关系——杜邦线/面包板走线在这种不受控的高速
-// 翻转下容易出现建立时间不足、过冲振铃，导致目标采样到错误电平（表现为 ACK/IDR 读取失败）。
-// 改用 CPU 周期计数忙等，保证亚微秒档也能按请求频率输出。周期数缓存在 dap_io_set_clock() 里算好，
-// 避免每个 bit 都重复调用 esp_rom_get_cpu_ticks_per_us()。
-// 高频（fast 档）时完全不延时，翻转速率由 GPIO 写指令本身决定（bit-bang 极限 ~5MHz）。
-// IRAM_ATTR：时序函数放 IRAM，执行不经过 flash cache，避免 WiFi 占用 cache 时引入抖动。
-static inline IRAM_ATTR void half_period_delay(void)
+// 忙等延时。所有档位统一用 CPU 周期计数忙等（含低频），不在半周期里调用 esp_rom_delay_us，
+// 避免函数调用/ROM 调用开销影响高频档精度。
+// always_inline：把 entry/retw 与多余判断开销从热路径里去掉，否则 slow 档固定开销会高达 ~50 周期，
+// 导致“请求 2MHz 实测只有 1.38MHz”且 slow 档最高只能到 ~2.3MHz。
+// IRAM_ATTR：时序函数放 SRAM，执行不经过 flash cache，避免 WiFi 占用 cache 时引入抖动。
+static inline __attribute__((always_inline)) IRAM_ATTR void half_period_delay(void)
 {
     if (s_fast_clock) {
-        return; // fast 档：无延时
+        // fast 档：加少量 nop，把速率稳定在 ~5MHz。不加的话内联后 fast 档会冲到 ~6.5MHz，
+        // 读采样点相对 CLK 下降沿过近（GPIO 写/读各有跨时钟域延迟），目标可能来不及建立数据。
+        __asm__ __volatile__("nop; nop; nop; nop; nop; nop;");
+    } else if (s_half_period_cycles != 0) {
+        // slow 档：忙等 cycles 个 CPU 周期（含低频档，统一用周期计数，不调 esp_rom_delay_us）
+        uint32_t start = esp_cpu_get_cycle_count();
+        while ((esp_cpu_get_cycle_count() - start) < s_half_period_cycles) {
+        }
     }
-    if (s_half_period_ns >= 1000) {
-        esp_rom_delay_us(s_half_period_ns / 1000);
-        return;
-    }
-    if (s_half_period_cycles == 0) {
-        __asm__ __volatile__("nop; nop; nop; nop;");
-        return;
-    }
-    uint32_t start = esp_cpu_get_cycle_count();
-    while ((esp_cpu_get_cycle_count() - start) < s_half_period_cycles) {
-        // 忙等
-    }
+    // cycles == 0 且非 fast 档：无延时（仅初始态/断层区间出现，无害）
 }
 
 // 参照 ARM 官方 CMSIS-DAP 参考实现（PORT_SWD_SETUP / PIN_SWDIO_OUT_ENABLE|DISABLE）：
@@ -159,28 +154,30 @@ void dap_io_set_clock(uint32_t clock_hz)
     uint64_t half_ns = 1000000000ULL / (2ULL * clock_hz);
     s_half_period_ns = (uint32_t)half_ns;
 
-    if (s_half_period_ns >= 1000) {
-        // <= 500kHz：用 esp_rom_delay_us。周期长、被打断无害，不加临界区。
-        s_fast_clock = false;
-        s_half_period_cycles = 0;
-        s_use_critical = false;
-        return;
-    }
-
-    // 亚微秒档：把半周期换算成 CPU 周期数
-    uint32_t ticks_per_us = esp_rom_get_cpu_ticks_per_us();
+    // 把半周期换算成 CPU 周期数。
+    // 用编译期常量 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ，而不是 esp_rom_get_cpu_ticks_per_us()：
+    // 后者是 ROM 的 ets_get_cpu_frequency()，其缓存在某些启动路径下可能停留在 ROM 默认值(80)，
+    // 导致 half_cycles 偏小、中低频被误判进 fast 档（实测“请求 2MHz 却输出 4.7MHz”的根因）。
+    uint32_t ticks_per_us = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
     uint32_t half_cycles = (uint32_t)((uint64_t)s_half_period_ns * ticks_per_us / 1000);
 
-    if (half_cycles <= DAP_BIT_OVERHEAD_CYCLES) {
+    if (half_cycles <= DAP_FAST_OVERHEAD_CYCLES) {
         // 目标半周期已小于翻转固定开销 → fast 档：不再忙等，输出即 bit-bang 极限速率
         s_fast_clock = true;
         s_half_period_cycles = 0;
-    } else {
+    } else if (half_cycles > DAP_SLOW_OVERHEAD_CYCLES) {
         // slow 档：忙等“目标半周期 - 固定开销”，精确匹配请求频率
         s_fast_clock = false;
-        s_half_period_cycles = half_cycles - DAP_BIT_OVERHEAD_CYCLES;
+        s_half_period_cycles = half_cycles - DAP_SLOW_OVERHEAD_CYCLES;
+    } else {
+        // 介于 fast 阈值与 slow 极限之间：slow 档忙等 0，输出 slow 档固定开销速率（尽量快）
+        s_fast_clock = false;
+        s_half_period_cycles = 0;
     }
-    s_use_critical = true; // 亚微秒档：bit 周期短，需要临界区防 ISR 拉长半周期
+
+    // 临界区：仅半周期较短（>500kHz）时加，防 ISR 拉长半周期；
+    // 低频档周期长、被打断无害，且避免在临界区里长时间关中断。
+    s_use_critical = (s_half_period_ns < 1000);
 }
 
 uint8_t dap_io_get_swj_pins(void)

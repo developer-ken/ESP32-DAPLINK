@@ -8,12 +8,15 @@
 #define DAP_SWD_DIO_PIN        GPIO_NUM_38   // SWDIO (双向)
 
 // ---------------- SWD/JTAG 位带时序校准 ----------------
-// 半个 SWCLK/TCK 周期内，除忙等延时外“固定开销”（GPIO 写 + 循环分支）消耗的 CPU 周期数。
-// 用途：1) 请求频率足够高时进入 fast 档——不再忙等，由指令开销本身决定实际速率（即 bit-bang 极限）；
-//      2) slow 档精确分频——忙等周期数 = 目标半周期 - 本开销。
-// 该值与 CPU 主频、引脚是否走 GPIO 矩阵、编译优化等级有关，请用示波器实测 SWCLK 频率微调。
-// 经验参考：ESP32-S3 @240MHz ≈ 23（cmsis_dap_tcp_esp32 实测值）。实际频率偏高时调大、偏低时调小。
-#define DAP_BIT_OVERHEAD_CYCLES   23
+// half_period_delay() 已强制内联。半周期耗时 = 翻转/循环开销 + 忙等 cycles。
+// 两个常量分别用于 fast 档判定与 slow 档补偿，需按 CPU 主频实测微调（示波器抓 SWCLK）。
+//   DAP_FAST_OVERHEAD_CYCLES：fast 档（6 个 nop，无忙等）半周期的固定开销。
+//   DAP_SLOW_OVERHEAD_CYCLES：slow 档（有忙等）半周期中“非忙等部分”的固定开销。
+//                            slow 档忙等 cycles = 目标半周期 - 该值。
+// 校准法：先测 fast 档实际频率 f_fast，则 FAST ≈ CPU_MHz/(2*f_fast)；
+//         再测任一 slow 档请求（如 2MHz），若实测偏低则增大 SLOW、偏高则减小 SLOW。
+#define DAP_FAST_OVERHEAD_CYCLES   24
+#define DAP_SLOW_OVERHEAD_CYCLES   24
 
 // ---------------- JTAG 引脚定义 ----------------
 #define DAP_JTAG_TCK_PIN       GPIO_NUM_36   // 与 SWCLK 共用
