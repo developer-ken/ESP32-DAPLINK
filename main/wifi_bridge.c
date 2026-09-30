@@ -2,6 +2,7 @@
 // 成功后启动 mDNS 与 openocd remote_bitbang TCP 服务
 #include "wifi_bridge.h"
 #include "remote_bitbang.h"
+#include "cmsis_dap_tcp.h"
 #include "dap_config.h"
 #include "status_led.h"
 #include "esp_wifi.h"
@@ -112,8 +113,10 @@ bool wifi_bridge_start(void)
     mdns_hostname_set(WIFI_DEBUG_MDNS_HOSTNAME);
     mdns_instance_name_set(WIFI_DEBUG_MDNS_INSTANCE);
     mdns_service_add(NULL, "_openocd", "_tcp", WIFI_DEBUG_BITBANG_PORT, NULL, 0);
+    mdns_service_add(NULL, "_cmsis-dap", "_tcp", WIFI_DEBUG_CMSIS_DAP_PORT, NULL, 0);
     ESP_LOGI(TAG, "mDNS 就绪: %s.local", WIFI_DEBUG_MDNS_HOSTNAME);
 
     remote_bitbang_start(WIFI_DEBUG_BITBANG_PORT);
+    cmsis_dap_tcp_start(WIFI_DEBUG_CMSIS_DAP_PORT);
     return true;
 }

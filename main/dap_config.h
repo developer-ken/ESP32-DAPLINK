@@ -53,6 +53,7 @@
 #define WIFI_DEBUG_MDNS_HOSTNAME  "eggydebugger" // -> eggydebugger.local
 #define WIFI_DEBUG_MDNS_INSTANCE  "Eggy CMSIS-DAP Wi-Fi Bridge"
 #define WIFI_DEBUG_BITBANG_PORT   3335           // openocd remote_bitbang 默认口
+#define WIFI_DEBUG_CMSIS_DAP_PORT 3333           // openocd cmsis-dap backend tcp 端口
 
 // USB 是否成功挂载的判定超时时间 (ms)
 #define USB_MOUNT_WAIT_MS         3000
