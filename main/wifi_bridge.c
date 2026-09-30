@@ -3,6 +3,7 @@
 #include "wifi_bridge.h"
 #include "remote_bitbang.h"
 #include "dap_config.h"
+#include "status_led.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -20,12 +21,15 @@ static const char *TAG = "wifi_bridge";
 
 static EventGroupHandle_t s_event_group;
 
+// 红灯反映 Wi-Fi 连接进程：搜索中快闪、连接过程中慢闪、拿到 IP 常亮
 static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)data;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        status_led_set(LED_ID_RED, LED_MODE_SLOW_BLINK); // 掉线/连接未成功：慢闪重试
         xEventGroupSetBits(s_event_group, WIFI_FAIL_BIT);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        status_led_set(LED_ID_RED, LED_MODE_ON);         // 已拿到 IP：常亮
         xEventGroupSetBits(s_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -41,6 +45,7 @@ static bool try_connect(const char *ssid, const char *password)
     xEventGroupClearBits(s_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     esp_wifi_disconnect();
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    status_led_set(LED_ID_RED, LED_MODE_SLOW_BLINK); // 正在连接目标热点
     esp_wifi_connect();
 
     EventBits_t bits = xEventGroupWaitBits(s_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
@@ -64,6 +69,7 @@ bool wifi_bridge_start(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     wifi_scan_config_t scan_cfg = {0};
+    status_led_set(LED_ID_RED, LED_MODE_FAST_BLINK); // 正在搜索热点
     ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_cfg, true));
 
     uint16_t ap_count = 0;

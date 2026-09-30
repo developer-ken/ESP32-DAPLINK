@@ -26,16 +26,19 @@
 
 // ---------------- 公共控制引脚 ----------------
 #define DAP_NRESET_PIN         GPIO_NUM_35  // 目标复位 (开漏, 低有效)
-#define DAP_LED_CONNECT_PIN    GPIO_NUM_6   // 连接状态指示灯
-#define DAP_LED_RUNNING_PIN    GPIO_NUM_8   // 运行状态指示灯
+// ---------------- 状态指示灯（低电平点亮，由 status_led 全局任务统一驱动）----------------
+// 红灯：连接模式 —— USB 模式常亮；Wi-Fi 模式搜索中快闪、连接过程中慢闪、拿到 IP 后常亮
+// 紫灯：DAP 状态 —— 目标断开熄灭、已连接常亮、运行中快闪
+#define DAP_LED_RED_PIN       GPIO_NUM_6   // 连接模式指示灯
+#define DAP_LED_PURPLE_PIN    GPIO_NUM_8   // DAP 状态指示灯
 
 // 是否使用 nTRST（多数 Cortex-M 目标不需要）
 #define DAP_JTAG_HAS_TRST      1
 #define DAP_JTAG_TRST_PIN      GPIO_NUM_33
 
 // ---------------- 板载状态灯（低电平点亮）----------------
-#define BOARD_LED_PWR_PIN      GPIO_NUM_1   // 上电常亮，表示程序已开始运行
-#define BOARD_LED_ACT_PIN      GPIO_NUM_2   // 运行时 0.5s 间隔闪烁，表示主循环存活
+//#define BOARD_LED_PWR_PIN      GPIO_NUM_1   // 上电常亮，表示程序已开始运行
+//#define BOARD_LED_ACT_PIN      GPIO_NUM_2   // 运行时 0.5s 间隔闪烁，表示主循环存活
 
 // ---------------- USB 设备信息 ----------------
 #define DAP_USB_VID            0x303A       // Espressif VID

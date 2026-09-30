@@ -96,12 +96,7 @@ void dap_io_init(void)
     io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     gpio_config(&io_conf);
 
-    io_conf.mode = GPIO_MODE_OUTPUT;
-    io_conf.pin_bit_mask = (1ULL << DAP_LED_CONNECT_PIN) | (1ULL << DAP_LED_RUNNING_PIN);
-    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    gpio_config(&io_conf);
-    gpio_set_level(DAP_LED_CONNECT_PIN, 1);
-    gpio_set_level(DAP_LED_RUNNING_PIN, 1);
+    // LED 引脚不在这里配置：统一由 status_led_init() 管理
 
     // 引脚模式已配置完毕，断开态默认释放总线（只关 output-enable）
     dap_io_disconnect();
@@ -130,8 +125,6 @@ void dap_io_connect(uint8_t port)
         FAST_SET_LEVEL(DAP_JTAG_TMS_PIN, 1);
         FAST_SET_LEVEL(DAP_JTAG_TDI_PIN, 0);
     }
-
-    gpio_set_level(DAP_LED_CONNECT_PIN, port == DAP_PORT_DISABLED);
 }
 
 void dap_io_disconnect(void)
@@ -142,7 +135,6 @@ void dap_io_disconnect(void)
     gpio_ll_output_disable(GPIO_LL_GET_HW(0), DAP_SWD_DIO_PIN);
     gpio_ll_output_disable(GPIO_LL_GET_HW(0), DAP_JTAG_TDI_PIN);
     s_port = DAP_PORT_DISABLED;
-    gpio_set_level(DAP_LED_CONNECT_PIN, 1);
 }
 
 void dap_io_set_clock(uint32_t clock_hz)

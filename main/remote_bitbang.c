@@ -8,6 +8,7 @@
 //                     该映射沿用主流开源实现的约定，如与具体 OpenOCD 版本行为不完全一致，可按需调整
 #include "remote_bitbang.h"
 #include "swd_jtag.h"
+#include "dap.h"
 #include "dap_config.h"
 #include "esp_log.h"
 #include "lwip/sockets.h"
@@ -21,6 +22,7 @@ static void handle_client(int sock)
 {
     dap_io_connect(DAP_PORT_JTAG);
     dap_io_set_clock(1000000);
+    dap_led_set_connected(true); // 目标已连接：紫灯常亮
 
     uint8_t buf[128];
     while (1) {
@@ -36,6 +38,7 @@ static void handle_client(int sock)
                 send(sock, &reply, 1, 0);
             } else if (c == 'Q') {
                 dap_io_disconnect();
+                dap_led_set_connected(false); // 目标断开：紫灯熄灭
                 close(sock);
                 return;
             } else if (c == 'r' || c == 's' || c == 't' || c == 'u') {
@@ -49,6 +52,7 @@ static void handle_client(int sock)
         }
     }
     dap_io_disconnect();
+    dap_led_set_connected(false); // 客户端断开：紫灯熄灭
     close(sock);
 }
 

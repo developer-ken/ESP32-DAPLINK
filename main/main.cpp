@@ -3,33 +3,25 @@
 #include <cstdio>
 #include "dap_config.h"
 #include "dap.h"
+#include "status_led.h"
 #include "usb_descriptors.h"
 #include "msc_disk.h"
 #include "wifi_bridge.h"
 #include "nvs_flash.h"
 #include "tinyusb_default_config.h"
 #include "esp_log.h"
-#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const char *TAG = "main";
 
-// LED_PWR/LED_ACT 均为低电平点亮
-static void board_leds_init(void)
-{
-    gpio_config_t io_conf = {};
-    io_conf.pin_bit_mask = (1ULL << BOARD_LED_PWR_PIN) | (1ULL << BOARD_LED_ACT_PIN);
-    io_conf.mode = GPIO_MODE_OUTPUT;
-    gpio_config(&io_conf);
-    gpio_set_level(BOARD_LED_PWR_PIN, 1); // 先熄灭，初始化完成后再点亮
-    gpio_set_level(BOARD_LED_ACT_PIN, 1);
-}
-
+// 指示灯由全局 status_led 任务统一驱动（低电平点亮）：
+//   红灯：连接模式 —— USB 常亮；Wi-Fi 搜索中快闪、连接中慢闪、拿到 IP 常亮
+//   紫灯：DAP 状态 —— 目标断开熄灭、已连接常亮、运行中快闪（由 dap.c / remote_bitbang.c 维护）
 extern "C" void app_main(void)
 {
-    board_leds_init();
-    gpio_set_level(BOARD_LED_PWR_PIN, 0); // 程序已开始运行：常亮
+    status_led_init();
+    status_led_set(LED_ID_RED, LED_MODE_OFF); // 尝试建立 USB 连接中
 
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -64,17 +56,17 @@ extern "C" void app_main(void)
 
     if (usb_ok) {
         ESP_LOGI(TAG, "USB 已连接：以 \"%s\" 运行 CMSIS-DAP + 只读U盘", DAP_USB_PRODUCT);
+        status_led_set(LED_ID_RED, LED_MODE_ON); // USB 模式：红灯常亮
     } else {
         ESP_LOGW(TAG, "USB 未连接，切换到 Wi-Fi 调试桥");
-        if (!wifi_bridge_start()) {
-            ESP_LOGE(TAG, "Wi-Fi 调试桥启动失败，请检查热点/密码");
-        }
+        while (!wifi_bridge_start()){
+            ESP_LOGW(TAG, "WI-FI连接失败，1s后重试...");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        };
     }
 
     while (1) {
-        gpio_set_level(BOARD_LED_ACT_PIN, 0);
-        vTaskDelay(pdMS_TO_TICKS(500));
-        gpio_set_level(BOARD_LED_ACT_PIN, 1);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        // 指示灯由 status_led 任务维护，主任务只需保持存活
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }

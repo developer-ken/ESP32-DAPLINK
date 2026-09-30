@@ -1,6 +1,7 @@
 idf_component_register(SRCS "main.cpp"
                              "dap.c"
                              "swd_jtag.c"
+                             "status_led.c"
                              "usb_descriptors.c"
                              "msc_disk.c"
                              "wifi_bridge.c"

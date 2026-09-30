@@ -1,7 +1,7 @@
 #include "dap.h"
 #include "swd_jtag.h"
 #include "dap_config.h"
-#include "driver/gpio.h"
+#include "status_led.h"
 #include "esp_rom_sys.h"
 #include <string.h>
 
@@ -57,6 +57,38 @@ static uint16_t s_transfer_match_retry = 0;
 static uint8_t s_jtag_count = 0;
 static uint8_t s_jtag_ir_len[MAX_JTAG_DEVICES] = {4, 4, 4, 4};
 static uint8_t s_jtag_index = 0;
+
+// ---- 状态灯 ----
+// 灯的亮灭由全局 status_led 任务统一驱动（见 status_led.h），协议层只描述期望状态：
+//   LED_ID_PURPLE (DAP_LED_PURPLE_PIN) -> DAP 状态：目标断开=熄灭，已连接=常亮，运行中=快闪
+//   LED_ID_RED    (DAP_LED_RED_PIN)    -> 连接模式（USB/Wi-Fi），由 main/wifi_bridge 维护，协议层不碰
+static bool s_dap_connected = false;   // 目标是否已通过 DAP_CONNECT 连接
+static bool s_dap_running   = false;   // 目标是否处于运行态（HOST_STATUS type=1）
+
+// 依据“已连接/运行中”两个状态刷新紫灯
+static void dap_led_refresh(void)
+{
+    if (!s_dap_connected) {
+        status_led_set(LED_ID_PURPLE, LED_MODE_OFF);        // 目标断开：熄灭
+    } else if (s_dap_running) {
+        status_led_set(LED_ID_PURPLE, LED_MODE_FAST_BLINK); // 运行中：快闪
+    } else {
+        status_led_set(LED_ID_PURPLE, LED_MODE_ON);         // 已连接：常亮
+    }
+}
+
+void dap_led_set_connected(bool connected)
+{
+    s_dap_connected = connected;
+    if (!connected) s_dap_running = false;
+    dap_led_refresh();
+}
+
+void dap_led_set_running(bool running)
+{
+    s_dap_running = running;
+    dap_led_refresh();
+}
 
 void dap_init(void)
 {
@@ -272,7 +304,11 @@ uint16_t dap_process_command(const uint8_t *req, uint16_t req_len, uint8_t *resp
     case ID_DAP_HOST_STATUS: {
         uint8_t type = req[ri++];
         uint8_t status = req[ri++];
-        gpio_set_level(type == 0 ? DAP_LED_CONNECT_PIN : DAP_LED_RUNNING_PIN, !status);
+        if (type == 0) {
+            // type=0 为主机侧调试会话状态，不影响紫灯（紫灯只反映目标连接/运行）
+        } else {
+            dap_led_set_running(status != 0); // 目标运行中 -> 紫灯快闪，停止 -> 回常亮/熄灭
+        }
         resp[wi++] = DAP_OK;
         break;
     }
@@ -281,12 +317,14 @@ uint16_t dap_process_command(const uint8_t *req, uint16_t req_len, uint8_t *resp
         if (port == 0) port = DAP_PORT_SWD; // Default -> 优先 SWD
         dap_io_connect(port);
         s_port = port;
+        dap_led_set_connected(true); // 目标已连接：紫灯常亮
         resp[wi++] = port;
         break;
     }
     case ID_DAP_DISCONNECT: {
         dap_io_disconnect();
         s_port = DAP_PORT_DISABLED;
+        dap_led_set_connected(false); // 目标断开：紫灯熄灭
         resp[wi++] = DAP_OK;
         break;
     }
