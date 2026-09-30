@@ -1,4 +1,4 @@
-// 1MB storage 分区：首次上电自动格式化为 FAT 并放入说明文件，
+// 2.75MB storage 分区：首次上电自动格式化为 FAT 并放入说明文件，
 // 之后通过 esp_tinyusb 的 MSC 存储后端呈现给电脑
 // 注：当前 esp_tinyusb (v2.3.0) 的 MSC 存储后端未提供只读开关，
 // USB 主机在协议层面仍可写入；只读语义仅体现在“该分区仅用于分发文件”的使用约定上。
@@ -51,7 +51,16 @@ esp_err_t msc_disk_init(void)
         f = fopen("/storage/README.TXT", "w");
         if (f) {
             fputs("Eggy CMSIS-DAP\r\n"
-                  "This 1MB storage is provided for distributing files.\r\n",
+                  "本调试器支持 CMSIS-DAP 协议，在OpenOCD上可使用HID或TCP连接。\r\n"
+                  "当通过USB连接时，OpenOCD直接可以通过HID识别到调试器\r\n\r\n"
+                  "当连接到目标板，而未接入USB时，调试器自动搜索名称包含\"DEBUG\"的2.4GHz Wi-Fi 网络，并尝试使用与名称相同的密码连接\r\n"
+                  "连接后，设备通过mDNS注册eggydebugger.local，并暴露3335(remote-bitbang)和3333(OpenOCD CMSIS-DAP TCP)服务，请仅使用两者其一连接\r\n\r\n"
+                  "LED定义：\r\n"
+                  "红色：熄灭(正在启动或故障)/快闪(Wi-Fi搜索中)/慢闪(正在获取IP地址)/常亮(USB或Wi-Fi已连接)\r\n"
+                  "紫色：熄灭(OpenOCD未连接)/常亮(DAP状态-已连接)/快闪(DAP状态-运行中)\r\n\r\n"
+                  "存储空间中有裁剪版OpenOCD和配置文件，便于对STM32、ESP32等常见MCU一键调试。\r\n"
+                  "Designed by An-Egg\r\n"
+                  ,
                   f);
             fclose(f);
         }

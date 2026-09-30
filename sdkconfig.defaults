@@ -6,7 +6,7 @@ CONFIG_TINYUSB_VENDOR_COUNT=0
 CONFIG_TINYUSB_MSC_ENABLED=y
 CONFIG_TINYUSB_MSC_BUFSIZE=4096
 
-# Custom partition table with 1MB read-only "storage" data partition
+# Custom partition table with 2.75MB read-only "storage" data partition
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_OFFSET=0x8000

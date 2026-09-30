@@ -140,5 +140,9 @@ static void server_task(void *arg)
 
 void cmsis_dap_tcp_start(uint16_t port)
 {
+    // TCP 传输用大包 + 多缓冲，显著减少 WiFi 往返次数（参考 OpenOCD 后端 CMSIS_DAP_PACKET_SIZE=1024，
+    // 以及参考实现 bkuschak/cmsis_dap_tcp_esp32 的 DAP_PACKET_COUNT=8、OpenOCD 上限 4）。
+    dap_set_packet_size(DAP_TCP_PAYLOAD_MAX);
+    dap_set_packet_count(4);
     xTaskCreate(server_task, "cmsis_dap_tcp", 4096, (void *)(uintptr_t)port, 5, NULL);
 }

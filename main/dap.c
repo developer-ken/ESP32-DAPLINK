@@ -58,6 +58,20 @@ static uint8_t s_jtag_count = 0;
 static uint8_t s_jtag_ir_len[MAX_JTAG_DEVICES] = {4, 4, 4, 4};
 static uint8_t s_jtag_index = 0;
 
+// 上报给主机的传输参数：USB HID 用 64 字节小包；TCP 传输由 cmsis_dap_tcp.c 改大以提升吞吐
+static uint16_t s_packet_size  = DAP_PACKET_SIZE;
+static uint8_t  s_packet_count = DAP_PACKET_COUNT;
+
+void dap_set_packet_size(uint16_t packet_size)
+{
+    s_packet_size = packet_size;
+}
+
+void dap_set_packet_count(uint8_t packet_count)
+{
+    s_packet_count = packet_count;
+}
+
 // ---- 状态灯 ----
 // 灯的亮灭由全局 status_led 任务统一驱动（见 status_led.h），协议层只描述期望状态：
 //   LED_ID_PURPLE (DAP_LED_PURPLE_PIN) -> DAP 状态：目标断开=熄灭，已连接=常亮，运行中=快闪
@@ -282,8 +296,8 @@ static uint16_t dap_info(uint8_t id, uint8_t *resp)
     case 0x03: { const char *s = "EGGY0001"; uint8_t n = strlen(s) + 1; resp[0] = n; memcpy(&resp[1], s, n); return n + 1; }
     case 0x04: { const char *s = DAP_FW_VERSION; uint8_t n = strlen(s) + 1; resp[0] = n; memcpy(&resp[1], s, n); return n + 1; }
     case 0xF0: resp[0] = 1; resp[1] = 0x03; return 2; // SWD + JTAG 均支持
-    case 0xFE: resp[0] = 1; resp[1] = DAP_PACKET_COUNT; return 2;
-    case 0xFF: resp[0] = 2; resp[1] = DAP_PACKET_SIZE & 0xFF; resp[2] = (DAP_PACKET_SIZE >> 8) & 0xFF; return 3;
+    case 0xFE: resp[0] = 1; resp[1] = s_packet_count; return 2;
+    case 0xFF: resp[0] = 2; resp[1] = s_packet_size & 0xFF; resp[2] = (s_packet_size >> 8) & 0xFF; return 3;
     default: resp[0] = 0; return 1;
     }
 }

@@ -58,5 +58,5 @@
 // USB 是否成功挂载的判定超时时间 (ms)
 #define USB_MOUNT_WAIT_MS         3000
 
-// 1MB 只读存储分区在 partitions.csv 中的名字
+// 2.75MB 只读存储分区在 partitions.csv 中的名字
 #define STORAGE_PARTITION_LABEL   "storage"
