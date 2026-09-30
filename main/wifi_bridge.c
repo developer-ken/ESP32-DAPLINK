@@ -1,6 +1,7 @@
 // Wi-Fi 调试桥：扫描 SSID 中带有关键字的热点，尝试固定密码/SSID 自身作为密码连接，
 // 成功后启动 mDNS 与 openocd remote_bitbang TCP 服务
 #include "wifi_bridge.h"
+#include "wifi_config.h"
 #include "remote_bitbang.h"
 #include "cmsis_dap_tcp.h"
 #include "dap_config.h"
@@ -60,7 +61,19 @@ bool wifi_bridge_start(void)
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+
+    // 用户配置：优先使用配置文件中的静态 IP / SSID / mDNS 主机名
+    const wifi_user_config_t *cfg = wifi_config_get();
+    if (cfg->has_ip) {
+        esp_netif_ip_info_t ip_info = {0};
+        ip_info.ip.addr = esp_ip4addr_aton(cfg->ip_addr);
+        ip_info.netmask.addr = esp_ip4addr_aton(cfg->ip_netmask);
+        ip_info.gw.addr = esp_ip4addr_aton(cfg->ip_gateway);
+        ESP_ERROR_CHECK(esp_netif_dhcpc_stop(sta_netif));
+        ESP_ERROR_CHECK(esp_netif_set_ip_info(sta_netif, &ip_info));
+        ESP_LOGI(TAG, "使用静态 IP: %s / %s / %s", cfg->ip_addr, cfg->ip_netmask, cfg->ip_gateway);
+    }
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
@@ -69,38 +82,51 @@ bool wifi_bridge_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    wifi_scan_config_t scan_cfg = {0};
-    status_led_set(LED_ID_RED, LED_MODE_FAST_BLINK); // 正在搜索热点
-    ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_cfg, true));
-
-    uint16_t ap_count = 0;
-    esp_wifi_scan_get_ap_num(&ap_count);
-    if (ap_count == 0) {
-        ESP_LOGW(TAG, "未扫描到任何 Wi-Fi 热点");
-        return false;
-    }
-
-    wifi_ap_record_t *records = calloc(ap_count, sizeof(wifi_ap_record_t));
-    if (!records) return false;
-    esp_wifi_scan_get_ap_records(&ap_count, records);
-
     bool connected = false;
-    for (uint16_t i = 0; i < ap_count && !connected; i++) {
-        const char *ssid = (const char *)records[i].ssid;
-        if (strstr(ssid, WIFI_DEBUG_SSID_KEYWORD) == NULL) continue;
 
-        ESP_LOGI(TAG, "尝试连接调试热点: %s", ssid);
-        if (try_connect(ssid, WIFI_DEBUG_FIXED_PASSWORD)) {
-            connected = true;
-            break;
+    // 优先尝试连接配置文件指定的热点
+    if (cfg->ssid[0] != '\0') {
+        ESP_LOGI(TAG, "尝试连接配置文件指定的热点: %s", cfg->ssid);
+        connected = try_connect(cfg->ssid, cfg->password);
+        if (!connected) {
+            ESP_LOGW(TAG, "配置文件热点 %s 连接失败，回退到默认扫描方案", cfg->ssid);
         }
-        if (try_connect(ssid, ssid)) {
-            connected = true;
-            break;
-        }
-        ESP_LOGW(TAG, "连接 %s 失败，尝试下一个热点", ssid);
     }
-    free(records);
+
+    // 回退：扫描含关键字的调试热点（原有方案）
+    if (!connected) {
+        wifi_scan_config_t scan_cfg = {0};
+        status_led_set(LED_ID_RED, LED_MODE_FAST_BLINK); // 正在搜索热点
+        ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_cfg, true));
+
+        uint16_t ap_count = 0;
+        esp_wifi_scan_get_ap_num(&ap_count);
+        if (ap_count == 0) {
+            ESP_LOGW(TAG, "未扫描到任何 Wi-Fi 热点");
+            return false;
+        }
+
+        wifi_ap_record_t *records = calloc(ap_count, sizeof(wifi_ap_record_t));
+        if (!records) return false;
+        esp_wifi_scan_get_ap_records(&ap_count, records);
+
+        for (uint16_t i = 0; i < ap_count && !connected; i++) {
+            const char *ssid = (const char *)records[i].ssid;
+            if (strstr(ssid, WIFI_DEBUG_SSID_KEYWORD) == NULL) continue;
+
+            ESP_LOGI(TAG, "尝试连接调试热点: %s", ssid);
+            if (try_connect(ssid, WIFI_DEBUG_FIXED_PASSWORD)) {
+                connected = true;
+                break;
+            }
+            if (try_connect(ssid, ssid)) {
+                connected = true;
+                break;
+            }
+            ESP_LOGW(TAG, "连接 %s 失败，尝试下一个热点", ssid);
+        }
+        free(records);
+    }
 
     if (!connected) {
         ESP_LOGW(TAG, "没有可用的调试热点连接成功");
@@ -109,12 +135,13 @@ bool wifi_bridge_start(void)
 
     ESP_LOGI(TAG, "Wi-Fi 已连接");
 
+    const char *mdns_host = (cfg->mdns_hostname[0] != '\0') ? cfg->mdns_hostname : WIFI_DEBUG_MDNS_HOSTNAME;
     ESP_ERROR_CHECK(mdns_init());
-    mdns_hostname_set(WIFI_DEBUG_MDNS_HOSTNAME);
+    mdns_hostname_set(mdns_host);
     mdns_instance_name_set(WIFI_DEBUG_MDNS_INSTANCE);
     mdns_service_add(NULL, "_openocd", "_tcp", WIFI_DEBUG_BITBANG_PORT, NULL, 0);
     mdns_service_add(NULL, "_cmsis-dap", "_tcp", WIFI_DEBUG_CMSIS_DAP_PORT, NULL, 0);
-    ESP_LOGI(TAG, "mDNS 就绪: %s.local", WIFI_DEBUG_MDNS_HOSTNAME);
+    ESP_LOGI(TAG, "mDNS 就绪: %s.local", mdns_host);
 
     remote_bitbang_start(WIFI_DEBUG_BITBANG_PORT);
     cmsis_dap_tcp_start(WIFI_DEBUG_CMSIS_DAP_PORT);
