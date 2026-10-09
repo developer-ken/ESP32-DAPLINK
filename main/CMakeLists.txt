@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.cpp"
+idf_component_register(SRCS "swo.c" "main.cpp"
                              "dap.c"
                              "swd_jtag.c"
                              "status_led.c"

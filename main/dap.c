@@ -1,5 +1,6 @@
 #include "dap.h"
 #include "swd_jtag.h"
+#include "swo.h"
 #include "dap_config.h"
 #include "status_led.h"
 #include "esp_rom_sys.h"
@@ -24,6 +25,13 @@
 #define ID_DAP_JTAG_SEQUENCE         0x14
 #define ID_DAP_JTAG_CONFIGURE        0x15
 #define ID_DAP_JTAG_IDCODE           0x16
+#define ID_DAP_SWO_TRANSPORT         0x17
+#define ID_DAP_SWO_MODE              0x18
+#define ID_DAP_SWO_BAUDRATE          0x19
+#define ID_DAP_SWO_CONTROL           0x1A
+#define ID_DAP_SWO_STATUS            0x1B
+#define ID_DAP_SWO_DATA              0x1C
+#define ID_DAP_SWO_EXTENDED_STATUS   0x1E
 
 #define DAP_OK                       0x00
 #define DAP_ERROR                    0xFF
@@ -107,6 +115,7 @@ void dap_led_set_running(bool running)
 void dap_init(void)
 {
     dap_io_init();
+    swo_init();
     s_port = DAP_PORT_DISABLED;
 }
 
@@ -295,7 +304,8 @@ static uint16_t dap_info(uint8_t id, uint8_t *resp)
     case 0x02: { const char *s = DAP_USB_PRODUCT; uint8_t n = strlen(s) + 1; resp[0] = n; memcpy(&resp[1], s, n); return n + 1; }
     case 0x03: { const char *s = "EGGY0001"; uint8_t n = strlen(s) + 1; resp[0] = n; memcpy(&resp[1], s, n); return n + 1; }
     case 0x04: { const char *s = DAP_FW_VERSION; uint8_t n = strlen(s) + 1; resp[0] = n; memcpy(&resp[1], s, n); return n + 1; }
-    case 0xF0: resp[0] = 1; resp[1] = 0x03; return 2; // SWD + JTAG 均支持
+    case 0xF0: resp[0] = 1; resp[1] = 0x07; return 2; // SWD + JTAG + SWO UART 均支持
+    case 0xFD: { resp[0] = 4; uint32_t n = SWO_BUFFER_SIZE; memcpy(&resp[1], &n, 4); return 5; } // SWO 缓冲大小
     case 0xFE: resp[0] = 1; resp[1] = s_packet_count; return 2;
     case 0xFF: resp[0] = 2; resp[1] = s_packet_size & 0xFF; resp[2] = (s_packet_size >> 8) & 0xFF; return 3;
     default: resp[0] = 0; return 1;
@@ -584,6 +594,56 @@ uint16_t dap_process_command(const uint8_t *req, uint16_t req_len, uint8_t *resp
         uint32_t idcode = (uint32_t)idcode64;
         resp[wi++] = DAP_OK;
         memcpy(&resp[wi], &idcode, 4); wi += 4;
+        break;
+    }
+    case ID_DAP_SWO_TRANSPORT: {
+        uint8_t transport = req[ri++];
+        resp[wi++] = swo_set_transport(transport) ? DAP_OK : DAP_ERROR;
+        break;
+    }
+    case ID_DAP_SWO_MODE: {
+        // OpenOCD/pyOCD 只发 [0x18, mode] 两字节；完整规范请求里 mode 之后还带
+        // reserved + 波特率分频（4 字节 LE），但分频依赖目标 SWO 时钟、本实现无法换算，
+        // 波特率由后续 DAP_SWO_Baudrate 单独设置，这里只解析 mode 并忽略多余字节。
+        uint8_t mode = req[ri++];
+        resp[wi++] = swo_set_mode(mode) ? DAP_OK : DAP_ERROR;
+        break;
+    }
+    case ID_DAP_SWO_BAUDRATE: {
+        uint32_t baudrate;
+        memcpy(&baudrate, &req[ri], 4); ri += 4;
+        uint32_t actual = swo_set_baudrate(baudrate);
+        memcpy(&resp[wi], &actual, 4); wi += 4;
+        break;
+    }
+    case ID_DAP_SWO_CONTROL: {
+        uint8_t control = req[ri++];
+        swo_control(control != 0);
+        resp[wi++] = DAP_OK;
+        break;
+    }
+    case ID_DAP_SWO_STATUS: {
+        resp[wi++] = swo_get_status();
+        uint32_t count = swo_get_buffered_count();
+        memcpy(&resp[wi], &count, 4); wi += 4;
+        break;
+    }
+    case ID_DAP_SWO_DATA: {
+        uint16_t max_count = req[ri] | (req[ri + 1] << 8); ri += 2;
+        resp[wi++] = swo_get_status();                          // resp[1] = 状态
+        uint16_t count = swo_read(&resp[wi + 2], max_count);    // 数据从 resp[4] 开始
+        resp[wi++] = count & 0xFF;                              // resp[2..3] = 读取字节数
+        resp[wi++] = (count >> 8) & 0xFF;
+        wi += count;
+        break;
+    }
+    case ID_DAP_SWO_EXTENDED_STATUS: {
+        resp[wi++] = DAP_OK;                                    // 命令状态
+        resp[wi++] = swo_get_status();                          // trace 状态
+        uint32_t count = swo_get_buffered_count();
+        memcpy(&resp[wi], &count, 4); wi += 4;                  // trace 字节数
+        resp[wi++] = 0;                                         // event 数（UART 模式无事件）
+        resp[wi++] = 0;
         break;
     }
     default:

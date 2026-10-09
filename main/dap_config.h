@@ -24,6 +24,11 @@
 #define DAP_JTAG_TDI_PIN       GPIO_NUM_34  // 原 GPIO6 与板载 LED_ACT 冲突，改用此引脚
 #define DAP_JTAG_TDO_PIN       GPIO_NUM_9
 
+// ---------------- SWO 引脚定义 ----------------
+// SWO（Serial Wire Output）复用 TDO 引脚：SWO 属于 SWD 的 trace 输出，JTAG 的 TDO 不会同时使用
+#define DAP_SWO_PIN            GPIO_NUM_9    // 与 TDO 共用同一根物理引脚
+#define DAP_SWO_UART_NUM       1             // 接收 SWO 数据的 UART 外设（UART1）
+
 // ---------------- 公共控制引脚 ----------------
 #define DAP_NRESET_PIN         GPIO_NUM_35  // 目标复位 (开漏, 低有效)
 // ---------------- 状态指示灯（低电平点亮，由 status_led 全局任务统一驱动）----------------
