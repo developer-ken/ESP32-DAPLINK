@@ -33,12 +33,17 @@ void dap_io_swj_sequence(uint32_t count, const uint8_t *data);
 
 // ---------------- SWD ----------------
 void dap_io_swd_configure(uint8_t turnaround_cycles);
-void dap_io_swd_dio_to_output(void);
-void dap_io_swd_dio_to_input(void);
-void dap_io_swd_write_bits(uint32_t value, int count);   // 需先切到输出方向
-uint32_t dap_io_swd_read_bits(int count);                // 需先切到输入方向
-void dap_io_swd_turnaround(void);                        // 空转 N 个 SWCLK 周期（转向周期）
-void dap_io_swd_dio_idle_high(void);                     // 仅拉高 SWDIO 电平，不产生时钟脉冲（传输收尾用）
+
+// ---------------- SWD 帧传输（SPI 后端，仅 DAP_PORT_SWD 有效）----------------
+// 用 SPI 半双工把一次 SWD 帧的“写请求→转向→读ACK→读写数据”压缩为 2~3 次事务，
+// 避免逐 bit 的 write_bits/read_bits 带来的事务启动开销。内部已处理转向与 idle 收尾，
+// 协议层无需再显式调用 dio_to_* / turnaround。
+uint8_t  dap_io_swd_req_ack(uint32_t request_packet);    // 写 8bit 请求 + 转向 + 读 3bit ACK，返回 3bit ACK
+uint64_t dap_io_swd_read_phase(void);                     // 读 33bit(32data+1parity) + 转向（读→写），返回 (parity<<32)|data
+void     dap_io_swd_write_phase(uint32_t data, uint32_t parity); // 转向（读→写）+ 写 32data + 1parity
+void     dap_io_swd_idle(uint8_t idle_cycles);            // idle cycles 输出 0 + idle 高收尾
+void     dap_io_swd_finish(void);                         // WAIT/FAULT 收尾：转向输出 + idle 高
+void     dap_io_swd_drain(void);                          // 协议错误收尾：读 33bit 吸收 + 转向输出 + idle 高
 
 // ---------------- JTAG ----------------
 // 单个 TCK 周期：先给出 tms/tdi，再采样 tdo，返回 tdo 电平(0/1)

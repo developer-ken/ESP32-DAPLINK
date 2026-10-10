@@ -139,20 +139,14 @@ static uint8_t swd_transfer(uint8_t request, uint32_t *data)
     packet |= (request & 0x0F) << 1;
     packet |= parity << 5;
 
-    dap_io_swd_dio_to_output();
-    dap_io_swd_write_bits(packet, 8);
-
-    dap_io_swd_dio_to_input();
-    dap_io_swd_turnaround();
-
-    uint32_t ack = dap_io_swd_read_bits(3);
+    // SPI 后端：写请求(8) + 转向 + 读 ACK(3)，一次半双工事务完成
+    uint32_t ack = dap_io_swd_req_ack(packet);
 
     if (ack == DAP_TRANSFER_OK) {
         if (request & SWD_REQ_RnW) {
-            uint32_t value = dap_io_swd_read_bits(32);
-            uint32_t par = dap_io_swd_read_bits(1);
-            dap_io_swd_turnaround();
-            dap_io_swd_dio_to_output();
+            uint64_t rd = dap_io_swd_read_phase(); // 读 32+1parity + 转向
+            uint32_t value = (uint32_t)(rd & 0xFFFFFFFFu);
+            uint32_t par = (uint32_t)(rd >> 32);
             if (data) {
                 *data = value;
             }
@@ -160,35 +154,24 @@ static uint8_t swd_transfer(uint8_t request, uint32_t *data)
                 ack = DAP_TRANSFER_ERROR;
             }
         } else {
-            dap_io_swd_turnaround();
-            dap_io_swd_dio_to_output();
             uint32_t value = data ? *data : 0;
-            dap_io_swd_write_bits(value, 32);
-            dap_io_swd_write_bits(swd_parity32(value), 1);
+            dap_io_swd_write_phase(value, swd_parity32(value)); // 转向 + 写 32+1parity
         }
         // 按主机通过 DAP_TransferConfigure 配置的 idle cycles 补齐（OpenOCD 默认配置为 0）
-        if (s_transfer_idle_cycles) {
-            dap_io_swd_write_bits(0, s_transfer_idle_cycles);
-        }
-        dap_io_swd_dio_idle_high();
+        dap_io_swd_idle(s_transfer_idle_cycles);
         return (uint8_t)ack;
     }
 
     if (ack == DAP_TRANSFER_WAIT || ack == DAP_TRANSFER_FAULT) {
-        // WAIT/FAULT：无数据相位，但 ACK 阶段是目标在驱动总线，不管读写都必须先转向才能切回输出，
+        // WAIT/FAULT：无数据相位，但 ACK 阶段是目标在驱动总线，必须先转向才能切回输出，
         // 否则会在这一个 SWCLK 周期内跟目标抢总线，导致目标 SW-DP 协议错误、后续访问持续失败
-        dap_io_swd_turnaround();
-        dap_io_swd_dio_to_output();
-        dap_io_swd_dio_idle_high();
+        dap_io_swd_finish();
         return (uint8_t)ack;
     }
 
     // 协议错误（ACK 既不是 OK/WAIT/FAULT，例如总线悬空读回的垃圾值）：目标可能仍以为自己
     // 处在 32+1 位数据相位里，多放空这段周期再收回总线，避免只转向 1 拍就抢线
-    dap_io_swd_turnaround();
-    dap_io_swd_read_bits(33);
-    dap_io_swd_dio_to_output();
-    dap_io_swd_dio_idle_high();
+    dap_io_swd_drain();
     return (uint8_t)ack;
 }
 
