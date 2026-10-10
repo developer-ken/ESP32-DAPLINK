@@ -11,6 +11,9 @@ extern uint8_t const g_usb_fs_config_descriptor[];
 extern char const *g_usb_string_descriptor[];
 extern const size_t g_usb_string_descriptor_count;
 
+// 初始化 CMSIS-DAP v2 Bulk 相关回调绑定（如 SWO 流式输出），需在 USB 枚举前调用一次
+void usb_dap_init(void);
+
 #ifdef __cplusplus
 }
 #endif

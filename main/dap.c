@@ -618,7 +618,8 @@ uint16_t dap_process_command(const uint8_t *req, uint16_t req_len, uint8_t *resp
     }
     case ID_DAP_SWO_CONTROL: {
         uint8_t control = req[ri++];
-        swo_control(control != 0);
+        // 仅 bit0 (SWO_CAPTURE_ACTIVE) 控制启停；bit7 等其余位忽略
+        swo_control((control & 0x01) != 0);
         resp[wi++] = DAP_OK;
         break;
     }
@@ -631,7 +632,11 @@ uint16_t dap_process_command(const uint8_t *req, uint16_t req_len, uint8_t *resp
     case ID_DAP_SWO_DATA: {
         uint16_t max_count = req[ri] | (req[ri + 1] << 8); ri += 2;
         resp[wi++] = swo_get_status();                          // resp[1] = 状态
-        uint16_t count = swo_read(&resp[wi + 2], max_count);    // 数据从 resp[4] 开始
+        uint16_t count = 0;
+        // 仅 DATA 轮询通道经此命令返回数据；WINUSB 流式通道数据走 Bulk IN 端点，此处返回 0
+        if (swo_get_transport() == SWO_TRANSPORT_DATA) {
+            count = swo_read(&resp[wi + 2], max_count);         // 数据从 resp[4] 开始
+        }
         resp[wi++] = count & 0xFF;                              // resp[2..3] = 读取字节数
         resp[wi++] = (count >> 8) & 0xFF;
         wi += count;

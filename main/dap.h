@@ -1,4 +1,4 @@
-// CMSIS-DAP 命令处理：解析 USB HID / 网络远程调试收到的命令包，驱动 swd_jtag 完成实际时序
+// CMSIS-DAP 命令处理：解析 USB HID(v1) / USB Bulk(v2) / 网络远程调试收到的命令包，驱动 swd_jtag 完成实际时序
 #pragma once
 
 #include <stdint.h>

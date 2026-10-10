@@ -32,6 +32,7 @@ extern "C" void app_main(void)
 
     dap_init();
     msc_disk_init();
+    usb_dap_init(); // 绑定 CMSIS-DAP v2 Bulk 的 SWO 流式输出回调
 
     tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
     tusb_cfg.descriptor.device = &g_usb_device_descriptor;
