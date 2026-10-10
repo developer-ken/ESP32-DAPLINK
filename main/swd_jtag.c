@@ -1,49 +1,116 @@
 #include "swd_jtag.h"
 #include "dap_config.h"
 #include "driver/gpio.h"
-#include "esp_rom_sys.h"
-#include "esp_cpu.h"
 #include "esp_attr.h"
+#include "esp_log.h"
 #include "hal/gpio_ll.h"
+#include "soc/gpio_struct.h"
 #include "freertos/FreeRTOS.h"
 #include "sdkconfig.h"
 
-// gpio_set_level()/gpio_get_level() 经过驱动层的参数检查和自旋锁，单次调用开销可达数百 ns，
-// 在位带时序的热路径里会让实际翻转速率远低于请求频率（示波器实测 2MHz 请求只能跑出 ~300kHz）。
-// 改用 HAL 层的无锁寄存器读写，单次调用只有几条指令。
-#define FAST_SET_LEVEL(pin, level) gpio_ll_set_level(GPIO_LL_GET_HW(0), (pin), (level))
-#define FAST_GET_LEVEL(pin)        gpio_ll_get_level(GPIO_LL_GET_HW(0), (pin))
+// gpio_set_level()/gpio_get_level() 经过驱动层的参数检查和自旋锁，单次调用开销可达数百 ns。
+// 即使 HAL 的 gpio_ll_set_level() 也已带 if(level)/if(gpio<32) 分支、且每次重算 1<<pin。
+// 这里直接对 GPIO 寄存器做单条 store：SWD_CLK(36)/SWD_DIO(38)/JTAG_TDI(34) 都落在 GPIO32+
+// 的上排 bank，写 out1_w1ts/out1_w1tc 的 .val（整 32 位成员，避免位域写触发读改写）；
+// JTAG_TDO(9) 落在下排 bank，读 in。每条翻转最终编译为一次 store/load。
+#define SWCLK_BIT   (1u << (DAP_SWD_CLK_PIN - 32))
+#define SWDIO_BIT   (1u << (DAP_SWD_DIO_PIN - 32))
+#define TDI_BIT     (1u << (DAP_JTAG_TDI_PIN - 32))
+
+#define SWCLK_SET() do { GPIO.out1_w1ts.val = SWCLK_BIT; } while (0)
+#define SWCLK_CLR() do { GPIO.out1_w1tc.val = SWCLK_BIT; } while (0)
+#define SWDIO_SET() do { GPIO.out1_w1ts.val = SWDIO_BIT; } while (0)
+#define SWDIO_CLR() do { GPIO.out1_w1tc.val = SWDIO_BIT; } while (0)
+#define TDI_SET()   do { GPIO.out1_w1ts.val = TDI_BIT; } while (0)
+#define TDI_CLR()   do { GPIO.out1_w1tc.val = TDI_BIT; } while (0)
+
+#define SWDIO_RD()  ((GPIO.in1.val >> (DAP_SWD_DIO_PIN - 32)) & 1u)
+#define TDO_RD()    ((GPIO.in >> DAP_JTAG_TDO_PIN) & 1u)
+
+// JTAG 的 TCK/TMS 与 SWCLK/SWDIO 是同一根物理引脚，直接复用上面的宏
+#define TCK_SET()   SWCLK_SET()
+#define TCK_CLR()   SWCLK_CLR()
+#define TMS_SET()   SWDIO_SET()
+#define TMS_CLR()   SWDIO_CLR()
 
 static uint8_t s_port = DAP_PORT_DISABLED;
-static uint32_t s_half_period_ns = 1000; // 默认 ~500kHz
-static uint32_t s_half_period_cycles = 0; // 与 s_half_period_ns 配套，只在 dap_io_set_clock() 里算一次
+static uint32_t s_busy_cycles = 0;        // 传给 half_period_delay() 的忙等 cycles（由 set_clock 用校准结果反解）
+static uint32_t s_overhead = 0;           // 校准：N=0 时一个完整 SWCLK 周期的固定开销（含 SWDIO 分支+循环开销）
+static uint32_t s_slope_x1024 = 1024;     // 校准：完整周期随 N 的斜率，1024 定点（≈1024，即每 N 增 1 周期）
 static uint8_t s_turnaround_cycles = 1;
-static bool s_fast_clock = false;   // fast 档：不加延时，实际速率由翻转指令开销决定（bit-bang 极限）
-static bool s_use_critical = false; // 高频档才加临界区：低频档周期长、被打断无害，且避免长期关中断
+static bool s_use_critical = false;       // 高频档才加临界区：低频档周期长、被打断无害，且避免长期关中断
+static const char *TAG = "swd_jtag";
 
 // 位带时序不中断安全：WiFi/Tick ISR 在传输中途插入会拉长某个半周期（SWD 表现为 ACK/IDR 读错）。
 // 用自旋锁保护“单段连续位序列”（一次 write/read/turnaround），而不是整个命令，
 // 这样无关中断仍能在两段位序列之间得到服务。
 static portMUX_TYPE s_io_mux = portMUX_INITIALIZER_UNLOCKED;
 
-// 忙等延时。所有档位统一用 CPU 周期计数忙等（含低频），不在半周期里调用 esp_rom_delay_us，
-// 避免函数调用/ROM 调用开销影响高频档精度。
-// always_inline：把 entry/retw 与多余判断开销从热路径里去掉，否则 slow 档固定开销会高达 ~50 周期，
-// 导致“请求 2MHz 实测只有 1.38MHz”且 slow 档最高只能到 ~2.3MHz。
+// 单条指令读 CCOUNT（Xtensa rsr.ccount）。用内联汇编显式保证不产生函数调用开销，
+// 比 esp_cpu_get_cycle_count() 少了依赖编译器内联的一层不确定。
+static inline __attribute__((always_inline)) IRAM_ATTR uint32_t read_ccount(void)
+{
+    uint32_t ccount;
+    __asm__ __volatile__("rsr %0, ccount" : "=r"(ccount));
+    return ccount;
+}
+
+// 忙等延时。用“绝对目标 + 周期计数”统一实现，全频段（含低频）都用 CPU 周期忙等，
+// 不在半周期里调用 esp_rom_delay_us，避免函数/ROM 调用开销影响高频精度。
+// always_inline：把 entry/retw 与多余判断开销从热路径去掉。
 // IRAM_ATTR：时序函数放 SRAM，执行不经过 flash cache，避免 WiFi 占用 cache 时引入抖动。
+// 循环体为空 → 每轮仅 rsr + bltu 两条指令，2-cycle 粒度（比带 nop 的 4-cycle 细一倍）。
+// 用无符号比较：SWD 半周期最多数千 cycles，远小于 32 位回绕周期，无需有符号处理。
 static inline __attribute__((always_inline)) IRAM_ATTR void half_period_delay(void)
 {
-    if (s_fast_clock) {
-        // fast 档：加少量 nop，把速率稳定在 ~5MHz。不加的话内联后 fast 档会冲到 ~6.5MHz，
-        // 读采样点相对 CLK 下降沿过近（GPIO 写/读各有跨时钟域延迟），目标可能来不及建立数据。
-        __asm__ __volatile__("nop; nop; nop; nop; nop; nop;");
-    } else if (s_half_period_cycles != 0) {
-        // slow 档：忙等 cycles 个 CPU 周期（含低频档，统一用周期计数，不调 esp_rom_delay_us）
-        uint32_t start = esp_cpu_get_cycle_count();
-        while ((esp_cpu_get_cycle_count() - start) < s_half_period_cycles) {
-        }
+    uint32_t target = read_ccount() + s_busy_cycles;
+    while (read_ccount() < target) {
     }
-    // cycles == 0 且非 fast 档：无延时（仅初始态/断层区间出现，无害）
+}
+
+// 用与 dap_io_swd_write_bits() 完全一致的结构（含 SWDIO 的 if/else 分支 store、for 循环
+// 的 i++/比较/跳转）测一个完整 SWCLK 周期（两个半周期）的平均耗时，确保校准到的
+// 固定开销与真实热路径一致。
+static uint32_t measure_swclk_cycle(uint32_t busy)
+{
+    const uint32_t n = 256;
+    uint32_t save = s_busy_cycles;
+    s_busy_cycles = busy;
+
+    uint32_t start = read_ccount();
+    for (uint32_t i = 0; i < n; i++) {
+        if (i & 1) SWDIO_SET(); else SWDIO_CLR();
+        SWCLK_CLR();
+        half_period_delay();
+        SWCLK_SET();
+        half_period_delay();
+    }
+    uint32_t elapsed = read_ccount() - start;
+    s_busy_cycles = save;
+    return elapsed / n; // 每个完整 SWCLK 周期的平均 cycles
+}
+
+// 两点线性拟合：周期(N) = s_overhead + (s_slope_x1024/1024) * N。
+// 相比单点（只测 N=0）更能捕获忙等循环退出检测带来的斜率偏差，精度远高于写死常量。
+// 仅在 dap_io_init()（单线程、中断稳定）调用一次，无需 IRAM。
+static void calibrate_timing(void)
+{
+    const uint32_t N_REF = 300;
+    uint32_t c0 = measure_swclk_cycle(0);
+    uint32_t c1 = measure_swclk_cycle(N_REF);
+
+    s_overhead = c0;
+    uint32_t delta = c1 - c0;            // = 2 * slope * N_REF（一个周期含两次 delay）
+    uint32_t slope_x1024 = (uint32_t)((uint64_t)delta * 1024u / (2u * N_REF));
+    if (slope_x1024 == 0) {
+        slope_x1024 = 1024;              // 防御：理论斜率恒为 1024
+    }
+    s_slope_x1024 = slope_x1024;
+
+    // 报告校准结果：固定开销（完整周期 cycles）与对应的 bit-bang 最高频率
+    uint32_t max_hz = (uint32_t)((uint64_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ * 1000000ULL / s_overhead);
+    ESP_LOGI(TAG, "时序校准完成: 固定开销=%lu cycles (最高约 %lu Hz), 斜率=%lu/1024",
+             (unsigned long)s_overhead, (unsigned long)max_hz, (unsigned long)s_slope_x1024);
 }
 
 // 参照 ARM 官方 CMSIS-DAP 参考实现（PORT_SWD_SETUP / PIN_SWDIO_OUT_ENABLE|DISABLE）：
@@ -98,6 +165,9 @@ void dap_io_init(void)
 
     // LED 引脚不在这里配置：统一由 status_led_init() 管理
 
+    // 校准位带时序：实测零延时半周期的真实开销（此时 SWCLK 已配置且未断开）
+    calibrate_timing();
+
     // 引脚模式已配置完毕，断开态默认释放总线（只关 output-enable）
     dap_io_disconnect();
 }
@@ -114,16 +184,16 @@ void dap_io_connect(uint8_t port)
 
     if (port == DAP_PORT_SWD) {
         gpio_ll_output_enable(GPIO_LL_GET_HW(0), DAP_SWD_CLK_PIN);
-        FAST_SET_LEVEL(DAP_SWD_CLK_PIN, 1);
+        SWCLK_SET();
         dap_io_swd_dio_to_output();
-        FAST_SET_LEVEL(DAP_SWD_DIO_PIN, 1);
+        SWDIO_SET();
     } else if (port == DAP_PORT_JTAG) {
         gpio_ll_output_enable(GPIO_LL_GET_HW(0), DAP_JTAG_TCK_PIN);
         gpio_ll_output_enable(GPIO_LL_GET_HW(0), DAP_JTAG_TMS_PIN);
         gpio_ll_output_enable(GPIO_LL_GET_HW(0), DAP_JTAG_TDI_PIN);
-        FAST_SET_LEVEL(DAP_JTAG_TCK_PIN, 1);
-        FAST_SET_LEVEL(DAP_JTAG_TMS_PIN, 1);
-        FAST_SET_LEVEL(DAP_JTAG_TDI_PIN, 0);
+        TCK_SET();
+        TMS_SET();
+        TDI_CLR();
     }
 }
 
@@ -142,34 +212,30 @@ void dap_io_set_clock(uint32_t clock_hz)
     if (clock_hz == 0) {
         clock_hz = 500000;
     }
-    // 半周期时间 = 1e9 / (2 * freq)
-    uint64_t half_ns = 1000000000ULL / (2ULL * clock_hz);
-    s_half_period_ns = (uint32_t)half_ns;
 
-    // 把半周期换算成 CPU 周期数。
+    // 半周期换算成 CPU 周期数：half = CPU_MHz * 1e6 / (2 * freq)
     // 用编译期常量 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ，而不是 esp_rom_get_cpu_ticks_per_us()：
     // 后者是 ROM 的 ets_get_cpu_frequency()，其缓存在某些启动路径下可能停留在 ROM 默认值(80)，
     // 导致 half_cycles 偏小、中低频被误判进 fast 档（实测“请求 2MHz 却输出 4.7MHz”的根因）。
-    uint32_t ticks_per_us = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
-    uint32_t half_cycles = (uint32_t)((uint64_t)s_half_period_ns * ticks_per_us / 1000);
+    uint32_t half_cycles = (uint32_t)((uint64_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ * 1000000ULL / (2ULL * clock_hz));
 
-    if (half_cycles <= DAP_FAST_OVERHEAD_CYCLES) {
-        // 目标半周期已小于翻转固定开销 → fast 档：不再忙等，输出即 bit-bang 极限速率
-        s_fast_clock = true;
-        s_half_period_cycles = 0;
-    } else if (half_cycles > DAP_SLOW_OVERHEAD_CYCLES) {
-        // slow 档：忙等“目标半周期 - 固定开销”，精确匹配请求频率
-        s_fast_clock = false;
-        s_half_period_cycles = half_cycles - DAP_SLOW_OVERHEAD_CYCLES;
+    // 读时序安全下限：半周期再短目标可能来不及在下降沿后建立数据（SWD 读错）。
+    if (half_cycles < DAP_MIN_HALF_PERIOD_CYCLES) {
+        half_cycles = DAP_MIN_HALF_PERIOD_CYCLES;
+    }
+
+    // 目标完整周期 = 2 * half_cycles。用校准出的 offset/slope 反解忙等 cycles：
+    //   周期(N) = s_overhead + (s_slope_x1024/1024)*N   =>   N = (周期 - s_overhead) * 1024 / s_slope_x1024
+    uint32_t full = half_cycles * 2u;
+    if (full <= s_overhead) {
+        s_busy_cycles = 0;   // 已到 bit-bang 极限，输出即校准出的最高速率
     } else {
-        // 介于 fast 阈值与 slow 极限之间：slow 档忙等 0，输出 slow 档固定开销速率（尽量快）
-        s_fast_clock = false;
-        s_half_period_cycles = 0;
+        s_busy_cycles = (uint32_t)((uint64_t)(full - s_overhead) * 1024u / s_slope_x1024);
     }
 
     // 临界区：仅半周期较短（>500kHz）时加，防 ISR 拉长半周期；
-    // 低频档周期长、被打断无害，且避免在临界区里长时间关中断。
-    s_use_critical = (s_half_period_ns < 1000);
+    // 低频档周期长、被打断无害，且避免长期关中断。
+    s_use_critical = (clock_hz > 500000);
 }
 
 uint8_t dap_io_get_swj_pins(void)
@@ -221,10 +287,10 @@ void IRAM_ATTR dap_io_swj_sequence(uint32_t count, const uint8_t *data)
         if (s_port == DAP_PORT_JTAG) {
             dap_io_jtag_clock(bit, 0);
         } else {
-            FAST_SET_LEVEL(DAP_SWD_DIO_PIN, bit);
-            FAST_SET_LEVEL(DAP_SWD_CLK_PIN, 0);
+            if (bit) SWDIO_SET(); else SWDIO_CLR();
+            SWCLK_CLR();
             half_period_delay();
-            FAST_SET_LEVEL(DAP_SWD_CLK_PIN, 1);
+            SWCLK_SET();
             half_period_delay();
         }
     }
@@ -253,10 +319,10 @@ void IRAM_ATTR dap_io_swd_write_bits(uint32_t value, int count)
         portENTER_CRITICAL(&s_io_mux);
     }
     for (int i = 0; i < count; i++) {
-        FAST_SET_LEVEL(DAP_SWD_DIO_PIN, (value >> i) & 1);
-        FAST_SET_LEVEL(DAP_SWD_CLK_PIN, 0);
+        if (value & (1u << i)) SWDIO_SET(); else SWDIO_CLR();
+        SWCLK_CLR();
         half_period_delay();
-        FAST_SET_LEVEL(DAP_SWD_CLK_PIN, 1);
+        SWCLK_SET();
         half_period_delay();
     }
     if (s_use_critical) {
@@ -271,12 +337,12 @@ uint32_t IRAM_ATTR dap_io_swd_read_bits(int count)
         portENTER_CRITICAL(&s_io_mux);
     }
     for (int i = 0; i < count; i++) {
-        FAST_SET_LEVEL(DAP_SWD_CLK_PIN, 0);
+        SWCLK_CLR();
         half_period_delay();
-        if (FAST_GET_LEVEL(DAP_SWD_DIO_PIN)) {
+        if (SWDIO_RD()) {
             value |= (1u << i);
         }
-        FAST_SET_LEVEL(DAP_SWD_CLK_PIN, 1);
+        SWCLK_SET();
         half_period_delay();
     }
     if (s_use_critical) {
@@ -291,9 +357,9 @@ void IRAM_ATTR dap_io_swd_turnaround(void)
         portENTER_CRITICAL(&s_io_mux);
     }
     for (uint8_t i = 0; i < s_turnaround_cycles; i++) {
-        FAST_SET_LEVEL(DAP_SWD_CLK_PIN, 0);
+        SWCLK_CLR();
         half_period_delay();
-        FAST_SET_LEVEL(DAP_SWD_CLK_PIN, 1);
+        SWCLK_SET();
         half_period_delay();
     }
     if (s_use_critical) {
@@ -303,7 +369,7 @@ void IRAM_ATTR dap_io_swd_turnaround(void)
 
 void IRAM_ATTR dap_io_swd_dio_idle_high(void)
 {
-    FAST_SET_LEVEL(DAP_SWD_DIO_PIN, 1);
+    SWDIO_SET();
 }
 
 uint8_t IRAM_ATTR dap_io_jtag_clock(uint8_t tms, uint8_t tdi)
@@ -311,12 +377,12 @@ uint8_t IRAM_ATTR dap_io_jtag_clock(uint8_t tms, uint8_t tdi)
     if (s_use_critical) {
         portENTER_CRITICAL(&s_io_mux);
     }
-    FAST_SET_LEVEL(DAP_JTAG_TMS_PIN, tms ? 1 : 0);
-    FAST_SET_LEVEL(DAP_JTAG_TDI_PIN, tdi ? 1 : 0);
-    FAST_SET_LEVEL(DAP_JTAG_TCK_PIN, 0);
+    if (tms) TMS_SET(); else TMS_CLR();
+    if (tdi) TDI_SET(); else TDI_CLR();
+    TCK_CLR();
     half_period_delay();
-    uint8_t tdo = FAST_GET_LEVEL(DAP_JTAG_TDO_PIN);
-    FAST_SET_LEVEL(DAP_JTAG_TCK_PIN, 1);
+    uint8_t tdo = TDO_RD();
+    TCK_SET();
     half_period_delay();
     if (s_use_critical) {
         portEXIT_CRITICAL(&s_io_mux);
@@ -326,14 +392,14 @@ uint8_t IRAM_ATTR dap_io_jtag_clock(uint8_t tms, uint8_t tdi)
 
 void IRAM_ATTR dap_io_jtag_set_pins(uint8_t tck, uint8_t tms, uint8_t tdi)
 {
-    FAST_SET_LEVEL(DAP_JTAG_TMS_PIN, tms ? 1 : 0);
-    FAST_SET_LEVEL(DAP_JTAG_TDI_PIN, tdi ? 1 : 0);
-    FAST_SET_LEVEL(DAP_JTAG_TCK_PIN, tck ? 1 : 0);
+    if (tms) TMS_SET(); else TMS_CLR();
+    if (tdi) TDI_SET(); else TDI_CLR();
+    if (tck) TCK_SET(); else TCK_CLR();
 }
 
 uint8_t IRAM_ATTR dap_io_jtag_get_tdo(void)
 {
-    return FAST_GET_LEVEL(DAP_JTAG_TDO_PIN);
+    return TDO_RD();
 }
 
 void dap_io_set_nreset(bool asserted)

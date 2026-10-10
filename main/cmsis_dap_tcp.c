@@ -56,9 +56,10 @@ static int send_exact(int sock, const uint8_t *buf, int len)
 
 static void handle_client(int sock)
 {
-    // 单客户端串行处理，静态缓冲避免占用任务栈
+    // 单客户端串行处理，静态缓冲避免占用任务栈。
+    // out 前 8 字节预留包头、后接响应负载，合并成一次 send，避免 header/payload 拆成两个 TCP 段。
     static uint8_t req[DAP_TCP_PAYLOAD_MAX];
-    static uint8_t resp[DAP_TCP_PAYLOAD_MAX];
+    static uint8_t out[DAP_TCP_HEADER_SIZE + DAP_TCP_PAYLOAD_MAX];
 
     ESP_LOGI(TAG, "OpenOCD (cmsis-dap backend) 已连接");
     while (1) {
@@ -80,15 +81,16 @@ static void handle_client(int sock)
         }
         if (recv_exact(sock, req, length) <= 0) break;
 
-        uint16_t resp_len = dap_process_command(req, length, resp);
+        // 响应负载直接写到 out 的包头之后，包头与负载合并成一次 send
+        uint16_t resp_len = dap_process_command(req, length, out + DAP_TCP_HEADER_SIZE);
 
-        uint8_t out_hdr[DAP_TCP_HEADER_SIZE] = {
-            0x44, 0x41, 0x50, 0x00,
-            (uint8_t)(resp_len & 0xFF), (uint8_t)((resp_len >> 8) & 0xFF),
-            DAP_TCP_PKT_RESPONSE, 0x00
-        };
-        if (send_exact(sock, out_hdr, DAP_TCP_HEADER_SIZE) < 0) break;
-        if (resp_len && send_exact(sock, resp, resp_len) < 0) break;
+        out[0] = 0x44; out[1] = 0x41; out[2] = 0x50; out[3] = 0x00;
+        out[4] = (uint8_t)(resp_len & 0xFF);
+        out[5] = (uint8_t)((resp_len >> 8) & 0xFF);
+        out[6] = DAP_TCP_PKT_RESPONSE;
+        out[7] = 0x00;
+
+        if (send_exact(sock, out, DAP_TCP_HEADER_SIZE + resp_len) < 0) break;
     }
 
     // 客户端断开：复位调试口并熄灭紫灯
@@ -133,6 +135,12 @@ static void server_task(void *arg)
         // 关闭 Nagle 以降低延迟（OpenOCD 侧同样设置）
         int one = 1;
         setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+        // 加大收发缓冲，提升窗口吞吐、减少流控停顿（WiFi 下默认 5~8KB 偏小）
+        int sndbuf = 32 * 1024;
+        int rcvbuf = 32 * 1024;
+        setsockopt(client_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        setsockopt(client_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
         handle_client(client_sock);
     }

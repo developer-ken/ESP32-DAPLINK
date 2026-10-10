@@ -7,16 +7,16 @@
 #define DAP_SWD_CLK_PIN        GPIO_NUM_36   // SWCLK
 #define DAP_SWD_DIO_PIN        GPIO_NUM_38   // SWDIO (双向)
 
-// ---------------- SWD/JTAG 位带时序校准 ----------------
-// half_period_delay() 已强制内联。半周期耗时 = 翻转/循环开销 + 忙等 cycles。
-// 两个常量分别用于 fast 档判定与 slow 档补偿，需按 CPU 主频实测微调（示波器抓 SWCLK）。
-//   DAP_FAST_OVERHEAD_CYCLES：fast 档（6 个 nop，无忙等）半周期的固定开销。
-//   DAP_SLOW_OVERHEAD_CYCLES：slow 档（有忙等）半周期中“非忙等部分”的固定开销。
-//                            slow 档忙等 cycles = 目标半周期 - 该值。
-// 校准法：先测 fast 档实际频率 f_fast，则 FAST ≈ CPU_MHz/(2*f_fast)；
-//         再测任一 slow 档请求（如 2MHz），若实测偏低则增大 SLOW、偏高则减小 SLOW。
-#define DAP_FAST_OVERHEAD_CYCLES   24
-#define DAP_SLOW_OVERHEAD_CYCLES   24
+// ---------------- SWD/JTAG 位带时序 ----------------
+// 半周期实际开销不再写死：dap_io_init() 会运行时校准出“零延时半周期”的真实 cycles，
+// 之后 dap_io_set_clock() 用该值精确补偿，保证请求频率准确（不再依赖手工估的常量）。
+//
+// DAP_MIN_HALF_PERIOD_CYCLES：半周期的最短下限（即最高频率的硬上限）。
+// 必须给足 SWD 读的建立时间：目标在 SWCLK 下降沿驱动 SWDIO，主机在上升沿前采样，
+// 半周期太短会导致 ACK/IDR 读成 JUNK。240MHz 下：
+//   12 cycles ≈ 50ns 半周期 ≈ 10MHz（激进，需示波器确认目标能跟上）
+//   24 cycles ≈ 100ns 半周期 ≈ 5MHz（保守，稳定）
+#define DAP_MIN_HALF_PERIOD_CYCLES  12
 
 // ---------------- JTAG 引脚定义 ----------------
 #define DAP_JTAG_TCK_PIN       GPIO_NUM_36   // 与 SWCLK 共用
