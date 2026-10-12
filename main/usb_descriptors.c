@@ -184,7 +184,7 @@ char const *g_usb_string_descriptor[] = {
     DAP_USB_MANUFACTURER,       // 1
     DAP_USB_PRODUCT,            // 2
     s_usb_serial_str,           // 3: 序列号（由出厂 MAC 生成）
-    "Eggy CMSIS-DAP HID",       // 4
+    "Eggy CMSIS-DAP v1",        // 4
     "Eggy Storage",             // 5
     "Eggy CMSIS-DAP v2",        // 6: Bulk (WinUSB) 接口
 };

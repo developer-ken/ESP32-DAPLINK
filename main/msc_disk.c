@@ -8,12 +8,34 @@
 #include "esp_partition.h"
 #include "wear_levelling.h"
 #include "tinyusb_msc.h"
+#include "tusb.h"
 #include "esp_log.h"
 #include <stdio.h>
+#include <string.h>
 
 static const char *TAG = "msc_disk";
 static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
 static tinyusb_msc_storage_handle_t s_storage_handle;
+
+// 自定义 SCSI INQUIRY 返回的厂商/产品字符串，覆盖 esp_tinyusb 默认的
+// "TinyUSB / TEST MSC Storage"，从而改变 Windows 设备管理器里显示的磁盘名。
+// 注：esp_tinyusb 已强定义 v1 回调 tud_msc_inquiry_cb，故此处改用核心栈中的
+// 弱符号 v2 回调 tud_msc_inquiry2_cb；返回非 0 即可跳过 v1 回调。
+uint32_t tud_msc_inquiry2_cb(uint8_t lun, scsi_inquiry_resp_t *inquiry_resp, uint32_t bufsize)
+{
+    (void)lun;
+    (void)bufsize;
+
+    const char *vid = DAP_USB_MANUFACTURER_P; // "Eggy"
+    const char *pid = "Aux Storage";
+    const char *rev = "1.0";
+
+    memcpy(inquiry_resp->vendor_id, vid, strlen(vid));
+    memcpy(inquiry_resp->product_id, pid, strlen(pid));
+    memcpy(inquiry_resp->product_rev, rev, strlen(rev));
+
+    return sizeof(scsi_inquiry_resp_t);
+}
 
 esp_err_t msc_disk_init(void)
 {

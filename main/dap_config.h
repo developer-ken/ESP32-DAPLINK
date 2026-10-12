@@ -48,7 +48,8 @@
 // ---------------- USB 设备信息 ----------------
 #define DAP_USB_VID            0x303A       // Espressif VID
 #define DAP_USB_PID            0x8001
-#define DAP_USB_MANUFACTURER   "Eggy"
+#define DAP_USB_MANUFACTURER   "An-Egg"
+#define DAP_USB_MANUFACTURER_P "Eggy"
 #define DAP_USB_PRODUCT        "Eggy CMSIS-DAP"
 #define DAP_FW_VERSION         "v1.0.0"
 
