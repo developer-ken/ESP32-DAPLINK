@@ -33,6 +33,7 @@ extern "C" void app_main(void)
     dap_init();
     msc_disk_init();
     usb_dap_init(); // 绑定 CMSIS-DAP v2 Bulk 的 SWO 流式输出回调
+    usb_descriptors_init(); // 由出厂 MAC 生成唯一 USB 序列号（须在安装驱动前）
 
     tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
     tusb_cfg.descriptor.device = &g_usb_device_descriptor;

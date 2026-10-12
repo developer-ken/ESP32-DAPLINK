@@ -4,6 +4,9 @@
 #include "dap.h"
 #include "swo.h"
 #include <string.h>
+#include <stdio.h>
+#include "esp_mac.h"
+#include "esp_log.h"
 
 enum {
     ITF_NUM_HID = 0,
@@ -155,12 +158,32 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
     return false; // 不支持的请求 -> STALL
 }
 
+// ---------------- 序列号（由芯片 eFuse 出厂 MAC 生成） ----------------
+// "EGGY" + 12 位大写十六进制 MAC（共 16 字符 + '\0'），同一芯片每次上电生成结果一致。
+static char s_usb_serial_str[17];
+
+void usb_descriptors_init(void)
+{
+    uint8_t mac[6] = {0};
+    if (esp_efuse_mac_get_default(mac) != ESP_OK) {
+        ESP_LOGW("usb_desc", "读取出厂 MAC 失败，序列号回退为全零");
+    }
+    snprintf(s_usb_serial_str, sizeof(s_usb_serial_str),
+             "EGGY%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+const char *usb_serial_number(void)
+{
+    return s_usb_serial_str;
+}
+
 // ---------------- 字符串描述符 ----------------
 char const *g_usb_string_descriptor[] = {
     (const char[]){0x09, 0x04}, // 0: 语言 ID (English, 0x0409)
     DAP_USB_MANUFACTURER,       // 1
     DAP_USB_PRODUCT,            // 2
-    "EGGY0001",                 // 3: 序列号
+    s_usb_serial_str,           // 3: 序列号（由出厂 MAC 生成）
     "Eggy CMSIS-DAP HID",       // 4
     "Eggy Storage",             // 5
     "Eggy CMSIS-DAP v2",        // 6: Bulk (WinUSB) 接口

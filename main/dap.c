@@ -3,6 +3,7 @@
 #include "swo.h"
 #include "dap_config.h"
 #include "status_led.h"
+#include "usb_descriptors.h"
 #include "esp_rom_sys.h"
 #include <string.h>
 
@@ -302,7 +303,7 @@ static uint16_t dap_info(uint8_t id, uint8_t *resp)
     switch (id) {
     case 0x01: { const char *s = DAP_USB_MANUFACTURER; uint8_t n = strlen(s) + 1; resp[0] = n; memcpy(&resp[1], s, n); return n + 1; }
     case 0x02: { const char *s = DAP_USB_PRODUCT; uint8_t n = strlen(s) + 1; resp[0] = n; memcpy(&resp[1], s, n); return n + 1; }
-    case 0x03: { const char *s = "EGGY0001"; uint8_t n = strlen(s) + 1; resp[0] = n; memcpy(&resp[1], s, n); return n + 1; }
+    case 0x03: { const char *s = usb_serial_number(); uint8_t n = strlen(s) + 1; resp[0] = n; memcpy(&resp[1], s, n); return n + 1; }
     case 0x04: { const char *s = DAP_FW_VERSION; uint8_t n = strlen(s) + 1; resp[0] = n; memcpy(&resp[1], s, n); return n + 1; }
     case 0xF0: resp[0] = 1; resp[1] = 0x07; return 2; // SWD + JTAG + SWO UART 均支持
     case 0xFD: { resp[0] = 4; uint32_t n = SWO_BUFFER_SIZE; memcpy(&resp[1], &n, 4); return 5; } // SWO 缓冲大小
