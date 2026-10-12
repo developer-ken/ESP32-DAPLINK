@@ -61,7 +61,7 @@
 #define WIFI_DEBUG_CMSIS_DAP_PORT 3333           // openocd cmsis-dap backend tcp 端口
 
 // USB 是否成功挂载的判定超时时间 (ms)
-#define USB_MOUNT_WAIT_MS         3000
+#define USB_MOUNT_WAIT_MS         1000
 
 // 2.75MB 只读存储分区在 partitions.csv 中的名字
 #define STORAGE_PARTITION_LABEL   "storage"

@@ -12,7 +12,7 @@ app_main
  ├─ msc_disk_init()              挂载 storage(FAT) → 生成 README.TXT/wifi.cfg → wifi_config_load() → 交给 USB 主机
  ├─ usb_dap_init()               注册 SWO 流式 sink（Vendor Bulk IN）
  ├─ tinyusb_driver_install()     使用 usb_descriptors.c 里的自定义描述符
- ├─ 轮询 tud_mounted() 最多 USB_MOUNT_WAIT_MS(3000ms)
+ ├─ 轮询 tud_mounted() 最多 USB_MOUNT_WAIT_MS(1000ms)
  ├─ 成功 → 红灯常亮，USB 模式（HID/Bulk 回调驱动 DAP）
  └─ 失败 → while(!wifi_bridge_start()) 每秒重试    → Wi-Fi 模式
 ```

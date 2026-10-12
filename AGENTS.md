@@ -9,7 +9,7 @@
 用 GPIO 位带（bit-bang）实现 SWD / JTAG，另有 SWO(UART) trace。两种运行模式，上电自动选择：
 
 1. **USB 模式**（首选）：原生 USB-OTG 枚举为复合设备 —— CMSIS-DAP v1（HID）+ CMSIS-DAP v2（WinUSB Bulk）+ MSC（FAT 分区，存放 README / `wifi.cfg` / 裁剪版 OpenOCD）。
-2. **Wi-Fi 模式**（回退）：`USB_MOUNT_WAIT_MS`(3s) 内未被主机枚举 → 连 Wi-Fi，起 mDNS（`eggydebugger.local`）+ 两个 TCP 服务：
+2. **Wi-Fi 模式**（回退）：`USB_MOUNT_WAIT_MS`(1s) 内未被主机枚举 → 连 Wi-Fi，起 mDNS（`eggydebugger.local`）+ 两个 TCP 服务：
    `3335` OpenOCD `remote_bitbang`、`3333` OpenOCD `cmsis-dap backend tcp`（**二选一使用**）。
 
 ## 目录速览
