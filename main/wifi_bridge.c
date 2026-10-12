@@ -55,16 +55,19 @@ static bool try_connect(const char *ssid, const char *password)
     return (bits & WIFI_CONNECTED_BIT) != 0;
 }
 
-bool wifi_bridge_start(void)
+// 一次性初始化（netif / 事件循环 / Wi-Fi 驱动 / 静态 IP）。wifi_bridge_start 会被主任务反复重试，
+// 这些步骤重复执行会触发 ESP_ERROR_CHECK 失败，因此只在第一次调用时执行。
+static void wifi_bridge_init_once(const wifi_user_config_t *cfg)
 {
+    static bool s_inited = false;
+    if (s_inited) return;
+
     s_event_group = xEventGroupCreate();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
 
-    // 用户配置：优先使用配置文件中的静态 IP / SSID / mDNS 主机名
-    const wifi_user_config_t *cfg = wifi_config_get();
     if (cfg->has_ip) {
         esp_netif_ip_info_t ip_info = {0};
         ip_info.ip.addr = esp_ip4addr_aton(cfg->ip_addr);
@@ -82,6 +85,15 @@ bool wifi_bridge_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    s_inited = true;
+}
+
+bool wifi_bridge_start(void)
+{
+    // 用户配置：优先使用配置文件中的静态 IP / SSID / mDNS 主机名
+    const wifi_user_config_t *cfg = wifi_config_get();
+    wifi_bridge_init_once(cfg);
+
     bool connected = false;
 
     // 优先尝试连接配置文件指定的热点
@@ -97,7 +109,13 @@ bool wifi_bridge_start(void)
     if (!connected) {
         wifi_scan_config_t scan_cfg = {0};
         status_led_set(LED_ID_RED, LED_MODE_FAST_BLINK); // 正在搜索热点
-        ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_cfg, true));
+        // 上一次连接尝试可能仍在进行，扫描前先断开；扫描失败按"无可用热点"处理，交给上层重试
+        esp_wifi_disconnect();
+        esp_err_t scan_err = esp_wifi_scan_start(&scan_cfg, true);
+        if (scan_err != ESP_OK) {
+            ESP_LOGW(TAG, "Wi-Fi 扫描失败: %s", esp_err_to_name(scan_err));
+            return false;
+        }
 
         uint16_t ap_count = 0;
         esp_wifi_scan_get_ap_num(&ap_count);
